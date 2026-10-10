@@ -76,12 +76,12 @@ pub struct Voxel {
     pub updated_at: Option<String>,
 }
 
-/// One voxel to write: `voxel` is its position within `chunk`. The node API refuses a position
-/// outside the range below (since ck-api v2.29.0).
+/// One voxel to write: `voxel` is its position within `chunk`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoxelWrite {
     pub chunk: ChunkPos,
-    /// `(x, y, z)` within the chunk: 0 to 15 on each axis.
+    /// `(x, y, z)` within the chunk. Positions are the app's to define; an app on the 16×16×16
+    /// dense grid keeps to 0 to 15 on each axis.
     pub voxel: (i16, i16, i16),
     /// What a type means is up to the app.
     pub voxel_type: i16,
@@ -193,19 +193,8 @@ fn bad_request(message: impl Into<String>) -> CallError {
 
 fn op<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: Value) -> Result<R, CallError> {
     let body = serde_json::to_vec(&body).map_err(|e| bad_request(e.to_string()))?;
-    let bytes = send(ctx, name, &body)?;
+    let bytes = ctx.node(name, &body)?;
     serde_json::from_slice(&bytes).map_err(|e| bad_reply(name, e))
-}
-
-#[cfg(not(test))]
-fn send(ctx: &Ctx, name: &str, body: &[u8]) -> Result<Vec<u8>, CallError> {
-    ctx.node(name, body)
-}
-
-/// Unit tests stand in for the game API.
-#[cfg(test)]
-fn send(_ctx: &Ctx, name: &str, body: &[u8]) -> Result<Vec<u8>, CallError> {
-    tests::NODE.with(|n| n.borrow_mut().answer(name, body))
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -693,46 +682,54 @@ impl Access<'_> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use super::*;
     use crate::Kind;
+    use crate::abi::native::{self, Host};
 
     /// The game API as the tests stand it in: every operation sent, with its body, and the
     /// replies to give, in order.
     #[derive(Default)]
-    pub(super) struct FakeNode {
+    struct FakeNode {
         sent: Vec<(String, Value)>,
         replies: VecDeque<Value>,
     }
 
-    impl FakeNode {
-        pub(super) fn answer(&mut self, name: &str, body: &[u8]) -> Result<Vec<u8>, CallError> {
-            self.sent.push((name.to_owned(), serde_json::from_slice(body).expect("a JSON body")));
-            Ok(serde_json::to_vec(&self.replies.pop_front().expect("a reply for every operation")).unwrap())
+    struct Shared(Rc<RefCell<FakeNode>>);
+
+    impl Host for Shared {
+        fn node(&mut self, op: &str, payload: &[u8], _deadline_ms: u32) -> Vec<u8> {
+            let mut n = self.0.borrow_mut();
+            n.sent.push((op.to_owned(), serde_json::from_slice(payload).expect("a JSON body")));
+            let reply = n.replies.pop_front().expect("a reply for every operation");
+            [&[0][..], &serde_json::to_vec(&reply).unwrap()].concat()
         }
     }
 
-    thread_local! {
-        pub(super) static NODE: RefCell<FakeNode> = RefCell::default();
+    /// Runs `f` against the game API `node` stands in for.
+    fn with_node<T>(node: FakeNode, f: impl FnOnce(&Ctx) -> T) -> (T, FakeNode) {
+        let node = Rc::new(RefCell::new(node));
+        native::install(Some(Box::new(Shared(node.clone()))));
+        let ctx = Ctx { app: 7, instance: 1, epoch: 1, version: 1, kind: Kind::Hub, node_type: "t".into(), key: String::new() };
+        let out = f(&ctx);
+        native::install(None);
+        (out, Rc::try_unwrap(node).ok().expect("the host is gone").into_inner())
     }
 
     /// Runs `f`, the game API answering its one operation with `reply`: what `f` returned, and
     /// the operation and body it sent.
     fn exchange<T>(reply: Value, f: impl FnOnce(&Ctx) -> T) -> (T, String, Value) {
-        NODE.with(|n| *n.borrow_mut() = FakeNode { sent: Vec::new(), replies: VecDeque::from([reply]) });
-        let ctx = Ctx { app: 7, instance: 1, epoch: 1, version: 1, kind: Kind::Hub, node_type: "t".into(), key: String::new() };
-        let out = f(&ctx);
-        let (name, body) = NODE.with(|n| n.borrow_mut().sent.pop()).expect("one operation sent");
+        let (out, mut node) = with_node(FakeNode { sent: Vec::new(), replies: VecDeque::from([reply]) }, f);
+        let (name, body) = node.sent.pop().expect("one operation sent");
         (out, name, body)
     }
 
     /// `f` is refused before anything is sent.
     fn refused_here<T: std::fmt::Debug>(f: impl FnOnce(&Ctx) -> Result<T, CallError>) -> CallError {
-        NODE.with(|n| *n.borrow_mut() = FakeNode::default());
-        let ctx = Ctx { app: 7, instance: 1, epoch: 1, version: 1, kind: Kind::Hub, node_type: "t".into(), key: String::new() };
-        let e = f(&ctx).expect_err("refused");
-        assert!(NODE.with(|n| n.borrow().sent.is_empty()), "nothing sent");
-        e
+        let (out, node) = with_node(FakeNode::default(), f);
+        assert!(node.sent.is_empty(), "nothing sent");
+        out.expect_err("refused")
     }
 
     fn pos(x: i64, y: i64, z: i64) -> Value {
