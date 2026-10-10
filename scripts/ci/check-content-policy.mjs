@@ -52,6 +52,7 @@ const DENYLIST = [
   'cks-env',
   'ck-exec-mgr',
   '-ck-api-',
+  '/opt/cks',
 ];
 
 // A term allowed in one file, for a stated reason and only until the reason goes away. Anything
@@ -61,6 +62,12 @@ const CODEOWNERS_HEADER =
 const EXCEPTIONS = [
   { file: '.github/CODEOWNERS', term: 'cks-game-api', reason: CODEOWNERS_HEADER },
   { file: '.github/CODEOWNERS', term: 'infra-control-plane', reason: CODEOWNERS_HEADER },
+  {
+    file: 'checks/src/build/exec-source.spec.ts',
+    term: '/opt/cks',
+    reason:
+      "fixture paths in the platform's own spec, copied byte-identical; upstream moves them to neutral paths, and this entry goes with that sync",
+  },
   {
     file: 'crates/ckx-sdk/src/cron.rs',
     term: 'cks-game-api',
