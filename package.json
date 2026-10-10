@@ -52,7 +52,7 @@
     "build": "tsc -p tsconfig.build.json && chmod +x dist/cli/src/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "jest",
-    "test:cli": "node --test cli/test/",
+    "test:cli": "node --test cli/test/cli.test.mjs",
     "policy": "node scripts/ci/check-content-policy.mjs"
   },
   "devDependencies": {

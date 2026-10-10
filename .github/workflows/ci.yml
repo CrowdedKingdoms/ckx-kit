@@ -70,4 +70,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node dist/cli/src/main.js doctor
-      - run: node --test cli/test/
+      - run: node --test cli/test/cli.test.mjs

@@ -24,7 +24,7 @@ npm ci
 npm run typecheck
 npm test                 # the platform's check specs, unchanged
 npm run build
-node --test cli/test/    # needs Rust (the version in rust-toolchain.toml) and binaryen
+node --test cli/test/cli.test.mjs    # needs Rust (the version in rust-toolchain.toml) and binaryen
 npm run policy           # nothing here may name private infrastructure
 ```
 
