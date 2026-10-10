@@ -1,0 +1,11 @@
+[package]
+name = "instrument"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+radix-wasm-instrument = "1.0.0"
+# Match radix-wasm-instrument's parser/encoder generation.
+wasmparser = "0.107"
+wasm-encoder = "0.29"

@@ -1,0 +1,6 @@
+[toolchain]
+# Platform pin for compute-module builds. Bump deliberately: the artifact
+# cache keys include this version, so a bump recompiles every module.
+channel = "1.97.1"
+targets = ["wasm32-wasip1", "wasm32-unknown-unknown"]
+profile = "minimal"

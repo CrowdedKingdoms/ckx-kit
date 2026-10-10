@@ -1,0 +1,17 @@
+[package]
+name = "ckx-sdk"
+version = "0.8.0"
+edition = "2024"
+description = "Write ck-exec hubs, spokes and mods for Crowded Kingdoms in Rust, compiled to wasm32-unknown-unknown"
+license = "MIT OR Apache-2.0"
+homepage = "https://docs.crowdedkingdoms.com/exec/intro"
+repository = "https://github.com/CrowdedKingdoms/ckx-kit"
+readme = "README.md"
+keywords = ["crowded-kingdoms", "ck-exec", "wasm", "gamedev", "sdk"]
+categories = ["game-development", "wasm"]
+
+[dependencies]
+base64 = "0.22"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
