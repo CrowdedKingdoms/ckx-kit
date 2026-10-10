@@ -1,0 +1,15 @@
+[package]
+name = "crowdy-client-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Guest SDK for the CLIENT half of a ck-exec mod: browser WASM (ck ABI v0 + the client host calls)."
+license = "MIT OR Apache-2.0"
+homepage = "https://docs.crowdedkingdoms.com/exec/client-halves"
+repository = "https://github.com/CrowdedKingdoms/ckx-kit"
+readme = "README.md"
+keywords = ["crowded-kingdoms", "ck-exec", "wasm", "gamedev", "sdk"]
+categories = ["game-development", "wasm"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

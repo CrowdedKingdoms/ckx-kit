@@ -1,0 +1,13 @@
+[package]
+name = "grid-mod"
+description = "Starter mod: a player's code on a grid they own; greets visitors and follows what happens in the grid"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ckx-sdk = "0.8.0"
+serde = { version = "1", features = ["derive"] }

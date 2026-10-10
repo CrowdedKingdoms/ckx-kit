@@ -1,0 +1,73 @@
+name: CI
+
+# Every push to a tier branch and every pull request; the release workflow runs it as its build
+# step, so a release publishes what this tested.
+on:
+  push:
+    branches: [dev, test, prod]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: The platform's checks and their specs, the CLI's build, the policies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: npm ci
+      - run: npm run typecheck
+      - name: The copied check modules' own specs, unchanged
+        run: npm test
+      - run: npm run build
+      - name: Public content policy (the tree, dist/ included)
+        run: node scripts/ci/check-content-policy.mjs
+      - name: Privileged repository boundary
+        run: |
+          bash scripts/ci/guard-privileged-boundary.sh --self-test
+          bash scripts/ci/guard-privileged-boundary.sh
+      - name: The release tier guard refuses in both directions
+        run: bash scripts/ci/resolve-release-tier.test.sh
+      - name: What npm would publish
+        run: node scripts/ci/check-pack.mjs
+
+  crates:
+    name: The SDK crates and instrument
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: The pinned Rust (rust-toolchain.toml)
+        run: rustup toolchain install "$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)" --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip1
+      - run: cargo test --manifest-path crates/ckx-sdk/Cargo.toml
+      - run: cargo test --manifest-path crates/crowdy-client-sdk/Cargo.toml
+      - run: cargo build --release --target wasm32-unknown-unknown --manifest-path crates/ckx-sdk/Cargo.toml
+      - run: cargo build --release --target wasm32-unknown-unknown --manifest-path crates/crowdy-client-sdk/Cargo.toml
+      - name: instrument from its lock, as the platform builds it
+        run: cargo build --release --locked --manifest-path tools/instrument/Cargo.toml
+      - name: Each crate packages as crates.io would take it
+        run: |
+          cargo package --list --allow-dirty --manifest-path crates/ckx-sdk/Cargo.toml
+          cargo package --list --allow-dirty --manifest-path crates/crowdy-client-sdk/Cargo.toml
+
+  cli:
+    name: The CLI end to end (starters, templates, refusals)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: The pinned Rust and binaryen (wasm-opt, as on the platform's hosts)
+        run: |
+          rustup toolchain install "$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)" --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip1
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+          wasm-opt --version
+      - run: npm ci
+      - run: npm run build
+      - run: node dist/cli/src/main.js doctor
+      - run: node --test cli/test/cli.test.mjs
