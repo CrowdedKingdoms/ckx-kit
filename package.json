@@ -1,0 +1,83 @@
+{
+  "name": "@crowdedkingdoms/ckx-kit",
+  "version": "0.1.0",
+  "description": "Build, check and test Crowded Kingdoms ck-exec mods, hubs and spokes on your machine, as the platform builds them",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://docs.crowdedkingdoms.com/exec/intro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CrowdedKingdoms/ckx-kit.git"
+  },
+  "bugs": "https://github.com/CrowdedKingdoms/ckx-kit/issues",
+  "keywords": [
+    "crowded-kingdoms",
+    "ck-exec",
+    "wasm",
+    "gamedev",
+    "rust"
+  ],
+  "bin": {
+    "ckx-kit": "dist/cli/src/main.js"
+  },
+  "files": [
+    "dist/cli/src",
+    "dist/checks/src/build",
+    "crates/*/Cargo.toml",
+    "crates/*/README.md",
+    "crates/*/LICENSE-MIT",
+    "crates/*/LICENSE-APACHE",
+    "crates/*/src/**",
+    "tools/instrument/Cargo.toml",
+    "tools/instrument/Cargo.lock",
+    "tools/instrument/src",
+    "starters/ckx.json",
+    "starters/*/Cargo.toml",
+    "starters/*/src/**",
+    "templates/*/Cargo.toml",
+    "templates/*/src/**",
+    "checks/compute-toolchain/host-catalog.json",
+    "rust-toolchain.toml",
+    "vendor.lock",
+    "kit.pin",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli/src/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest",
+    "test:cli": "node --test cli/test/",
+    "policy": "node scripts/ci/check-content-policy.mjs"
+  },
+  "devDependencies": {
+    "@types/jest": "29.5.14",
+    "@types/node": "22.15.2",
+    "jest": "29.7.0",
+    "ts-jest": "29.3.2",
+    "typescript": "5.8.3"
+  },
+  "jest": {
+    "rootDir": "checks/src",
+    "testRegex": ".*\\.spec\\.ts$",
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
+    "transform": {
+      "^.+\\.(t|j)s$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/../../tsconfig.json"
+        }
+      ]
+    },
+    "testEnvironment": "node"
+  }
+}

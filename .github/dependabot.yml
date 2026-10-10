@@ -1,0 +1,37 @@
+# Dependabot: dependency and Actions updates, weekly, grouped (the org's security-hardening
+# program, 2026-09-08). Version updates target `dev`, not the GitHub default `prod`: merge green
+# low-risk PRs to `dev`, then promote `dev` -> `test` -> `prod`. Security-alert PRs still open
+# against `prod`; retarget or cherry-pick them onto `dev` rather than merging them into prod first.
+#
+# No cargo entry: the crates and tools here are byte-identical copies of the platform's
+# (kit.pin), so their dependencies change upstream and arrive with the next sync. A bot PR
+# against them would edit a copy.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    target-branch: dev
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # The copied checks and their specs compile and run under the platform's exact versions of
+      # these; they move when the platform's lockfile does.
+      - dependency-name: typescript
+      - dependency-name: "@types/node"
+      - dependency-name: jest
+      - dependency-name: ts-jest
+      - dependency-name: "@types/jest"
+      # Semver-major is a scheduled upgrade, not a weekly bot PR.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    target-branch: dev
