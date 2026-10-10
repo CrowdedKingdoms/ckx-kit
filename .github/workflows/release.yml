@@ -70,7 +70,7 @@ jobs:
       contents: write # the GitHub release
       id-token: write # crates.io and npm trusted publishing, and npm provenance
     outputs:
-      npm_version: ${{ steps.resolve.outputs.publish_version }}
+      npm_version: ${{ steps.publish.outputs.publish_version }}
     env:
       TIER: ${{ needs.guard.outputs.tier }}
       VERSION: ${{ needs.guard.outputs.version }}
@@ -131,12 +131,33 @@ jobs:
           tar -xzf "$RUNNER_TEMP"/crowdedkingdoms-ckx-kit-*.tgz -C "$RUNNER_TEMP/staged"
           node scripts/ci/check-content-policy.mjs "$RUNNER_TEMP/staged/package"
       - name: Publish the CLI
+        id: publish
         env:
           DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
-        run: npm publish --provenance --access public --tag "$DIST_TAG"
+          PUBLISH_VERSION: ${{ steps.resolve.outputs.publish_version }}
+        # A version npm staged but never published is used up, and `npm view` does not list it:
+        # on dev and test the next ordinal is tried instead (a few times at most).
+        run: |
+          set -euo pipefail
+          version="$PUBLISH_VERSION"
+          for attempt in 1 2 3 4 5; do
+            if npm publish --provenance --access public --tag "$DIST_TAG" 2>"$RUNNER_TEMP/publish.err"; then
+              echo "publish_version=$version" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/publish.err" >&2
+            if [ "$TIER" = prod ] || ! grep -qiE 'previously (staged|published) version' "$RUNNER_TEMP/publish.err"; then
+              exit 1
+            fi
+            base="${version%-*}"; n="${version##*.}"
+            version="${base}-${TIER}.$((n + 1))"
+            echo "::notice::$base-$TIER.$n is used up on npm; trying $version"
+            npm version "$version" --no-git-tag-version --allow-same-version
+          done
+          exit 1
       - name: What the registry now serves
         env:
-          PUBLISH_VERSION: ${{ steps.resolve.outputs.publish_version }}
+          PUBLISH_VERSION: ${{ steps.publish.outputs.publish_version }}
           DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
         run: |
           set -euo pipefail
@@ -151,7 +172,7 @@ jobs:
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISH_VERSION: ${{ steps.resolve.outputs.publish_version }}
+          PUBLISH_VERSION: ${{ steps.publish.outputs.publish_version }}
           DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
         run: |
           set -euo pipefail
