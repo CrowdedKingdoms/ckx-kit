@@ -84,9 +84,9 @@ jobs:
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
-      # npm trusted publishing requires npm 11.5.1 or later.
-      - name: Update npm
-        run: npm install -g npm@latest
+      # npm trusted publishing requires npm 11.5.1 or later; pinned, and moved on purpose.
+      - name: npm for trusted publishing
+        run: npm install -g npm@11.21.0
       - run: npm ci
 
       - name: Decide which crates are new for this tier

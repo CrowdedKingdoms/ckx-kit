@@ -68,10 +68,18 @@ function sources(dir) {
 }
 
 async function publishedVersions(crate) {
-  const res = await fetch(`https://crates.io/api/v1/crates/${crate}/versions?per_page=100`, { headers: UA });
-  if (res.status === 404) return [];
-  if (!res.ok) throw new Error(`${crate}: crates.io answered ${res.status}; refusing to guess what is published`);
-  return (await res.json()).versions.map((v) => v.num);
+  const versions = [];
+  let url = `https://crates.io/api/v1/crates/${crate}/versions?per_page=100`;
+  while (url) {
+    const res = await fetch(url, { headers: UA });
+    if (res.status === 404) return [];
+    if (!res.ok) throw new Error(`${crate}: crates.io answered ${res.status}; refusing to guess what is published`);
+    const body = await res.json();
+    versions.push(...body.versions.map((v) => v.num));
+    const next = body.meta?.next_page;
+    url = next ? `https://crates.io/api/v1/crates/${crate}/versions${next}` : null;
+  }
+  return versions;
 }
 
 /** The published crate's `src/` and dependencies, from its `.crate` file. */
