@@ -39,35 +39,32 @@ ckx_sdk::export_hub!(Counter);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ckx_sdk::testing::TestHub;
 
-    fn ctx() -> Ctx {
-        Ctx { app: 1, instance: 1, epoch: 1, version: 1, kind: Kind::Hub, node_type: "counter".into(), key: "main".into() }
-    }
+    use super::*;
 
     #[test]
     fn players_add_and_anyone_reads() {
-        let ctx = ctx();
-        let mut hub = Counter::spawn(&ctx, &[]).unwrap();
-        let five = encode(&5i64).unwrap();
-        hub.handle(&ctx, Call { caller: Caller::Player(7), method: "add", payload: &five }).unwrap();
-        let total: i64 = decode(&hub.handle(&ctx, Call { caller: Caller::Instance(2), method: "get", payload: &[] }).unwrap()).unwrap();
+        let mut hub = TestHub::<Counter>::spawn("counter", "main").unwrap();
+        let total: i64 = hub.call_typed(Caller::Player(7), "add", &5i64).unwrap();
         assert_eq!(total, 5);
+        let read: i64 = hub.call_typed(Caller::Instance(2), "get", &()).unwrap();
+        assert_eq!(read, 5);
     }
 
     #[test]
     fn only_players_add() {
-        let ctx = ctx();
-        let mut hub = Counter::spawn(&ctx, &[]).unwrap();
-        let one = encode(&1i64).unwrap();
-        assert!(hub.handle(&ctx, Call { caller: Caller::Instance(2), method: "add", payload: &one }).is_err());
+        let mut hub = TestHub::<Counter>::spawn("counter", "main").unwrap();
+        let refused = hub.call_typed::<_, i64>(Caller::Instance(2), "add", &1i64).unwrap_err();
+        assert_eq!(refused.status, Status::AppError);
+        assert_eq!(hub.hub().total, 0);
     }
 
     #[test]
-    fn the_snapshot_restores_the_total() {
-        let ctx = ctx();
-        let mut hub = Counter { total: 42 };
-        let snapshot = hub.persist(&ctx).unwrap();
-        assert_eq!(Counter::load(&ctx, &snapshot, 1).unwrap().total, 42);
+    fn the_total_survives_a_restart() {
+        let mut hub = TestHub::<Counter>::spawn("counter", "main").unwrap();
+        hub.call_typed::<_, i64>(Caller::Player(7), "add", &42i64).unwrap();
+        hub.restart().unwrap();
+        assert_eq!(hub.hub().total, 42);
     }
 }

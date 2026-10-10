@@ -62,18 +62,6 @@ const CODEOWNERS_HEADER =
 const EXCEPTIONS = [
   { file: '.github/CODEOWNERS', term: 'cks-game-api', reason: CODEOWNERS_HEADER },
   { file: '.github/CODEOWNERS', term: 'infra-control-plane', reason: CODEOWNERS_HEADER },
-  {
-    file: 'checks/src/build/exec-source.spec.ts',
-    term: '/opt/cks',
-    reason:
-      "fixture paths in the platform's own spec, copied byte-identical; upstream moves them to neutral paths, and this entry goes with that sync",
-  },
-  {
-    file: 'crates/ckx-sdk/src/cron.rs',
-    term: 'cks-game-api',
-    reason:
-      'a test comment in ckx-sdk 0.8.0, byte-identical to the SDK the platform compiles; the SDK drops it in 0.9.0, and this entry goes with that sync',
-  },
 ];
 
 const SKIP_DIRS = new Map([
@@ -160,12 +148,15 @@ function selfTest() {
     writeFileSync(join(fixture, 'dist', 'cli', 'main.js'), `// see ${DENYLIST[3]}/docs\n`);
     const planted = scan(fixture);
     check('a reference in dist/ (the published code) is refused', planted.findings.length > 0 ? 1 : 0, 1);
-    const cron = EXCEPTIONS.find((e) => e.file.endsWith('cron.rs'));
-    writeFileSync(join(fixture, 'crates', 'ckx-sdk', 'src', 'cron.rs'), `// ${cron.term}\n`);
+    const stated = EXCEPTIONS[0];
+    const excepted = join(fixture, stated.file);
+    mkdirSync(dirname(excepted), { recursive: true });
+    writeFileSync(excepted, `# ${stated.term}\n`);
     check('the stated exception passes in its own file', scan(fixture).findings.length, planted.findings.length);
-    writeFileSync(join(fixture, 'crates', 'ckx-sdk', 'src', 'lib.rs'), `// ${cron.term}\n`);
+    writeFileSync(join(fixture, 'crates', 'ckx-sdk', 'src', 'lib.rs'), `// ${stated.term}\n`);
     check('the same term in another file is refused', scan(fixture).findings.length, planted.findings.length + 1);
-    writeFileSync(join(fixture, 'crates', 'ckx-sdk', 'src', 'cron.rs'), `// ${DENYLIST[0]}\n`);
+    const other = DENYLIST.find((t) => !EXCEPTIONS.some((e) => e.file === stated.file && e.term === t));
+    writeFileSync(excepted, `# ${other}\n`);
     check('another term in the excepted file is refused', scan(fixture).findings.length, planted.findings.length + 2);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
