@@ -112,7 +112,7 @@ describe('validateExecManifest', () => {
     const dep = (table: string) =>
       CARGO.replace('serde = { version = "1", features = ["derive"] }', table);
     for (const table of [
-      'serde = { version = "1", "path" = "/opt/cks/compute-toolchain/ckx-starters/world-tick" }',
+      'serde = { version = "1", "path" = "/toolchain/ckx-starters/world-tick" }',
       "serde = { version = \"1\", 'path' = '../serde' }",
       'serde = { "package" = "syn", version = "2", "path" = "/x" }',
       'serde = { version = "1", "pa\\u0074h" = "/x" }',
@@ -160,13 +160,8 @@ describe('validateExecCrates', () => {
 
 describe('rewriteExecManifest', () => {
   it('points ckx-sdk at the toolchain and appends the release profile', () => {
-    const out = rewriteExecManifest(
-      CARGO,
-      '/opt/cks/compute-toolchain/ckx-sdk',
-    );
-    expect(out).toContain(
-      'ckx-sdk = { path = "/opt/cks/compute-toolchain/ckx-sdk" }',
-    );
+    const out = rewriteExecManifest(CARGO, '/toolchain/ckx-sdk');
+    expect(out).toContain('ckx-sdk = { path = "/toolchain/ckx-sdk" }');
     expect(out).not.toContain('../../crates/ckx-sdk');
     expect(out).toContain('[profile.release]');
     expect(out).toContain('panic = "abort"');
@@ -283,11 +278,11 @@ serde_json = "1"
   it('point crowdy-client-sdk at the toolchain', () => {
     const out = rewriteExecManifest(
       CLIENT_CARGO,
-      '/opt/cks/compute-toolchain/crowdy-client-sdk',
+      '/toolchain/crowdy-client-sdk',
       'client',
     );
     expect(out).toContain(
-      'crowdy-client-sdk = { path = "/opt/cks/compute-toolchain/crowdy-client-sdk" }',
+      'crowdy-client-sdk = { path = "/toolchain/crowdy-client-sdk" }',
     );
     expect(out).toContain('[profile.release]');
     expect(out).toContain('[package.metadata.crowdy]');

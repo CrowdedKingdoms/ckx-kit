@@ -505,7 +505,7 @@ mod tests {
         format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", s / 3600, s / 60 % 60, s % 60, ms % 1000)
     }
 
-    // Generated from legacy's cron-parser 4.9.0 (cks-game-api's `computeNextRunAt`) with TZ=UTC:
+    // Generated from cron-parser 4.9.0, the legacy automations' scheduler, with TZ=UTC:
     // each expression, the instant it is asked from, and its next occurrences in order.
     const GOLDEN: &[(&str, &str, &[&str])] = &[
         ("* * * * *", "2026-09-26T12:00:00.000Z", &["2026-09-26T12:01:00.000Z", "2026-09-26T12:02:00.000Z", "2026-09-26T12:03:00.000Z"]),

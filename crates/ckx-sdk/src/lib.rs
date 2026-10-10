@@ -40,14 +40,21 @@
 //! the app ([`Hub::on_presence`], root hub only) and players' connections subscribing to them
 //! ([`Hub::on_session`]). A timer can follow a cron schedule, the legacy automations' syntax:
 //! see [`cron`] and [`Ctx::timer_cron`].
+//!
+//! Nodes are unit tested natively with `cargo test`: `testing` runs one against a fake of the
+//! platform (calls, timers, events, snapshots, the node API, a mod's grid). [`limits`] has the
+//! platform's bounds.
 
 mod abi;
 pub mod cron;
 pub mod emit;
+pub mod limits;
 pub mod model;
 pub mod node;
 #[doc(hidden)]
 pub mod rt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod testing;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -257,6 +264,25 @@ impl Status {
             10 => Status::Trapped,
             11 => Status::BadRequest,
             other => Status::Unknown(other),
+        }
+    }
+
+    /// The wire status code: [`Status::from_u8`] reversed.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Status::Ok => 0,
+            Status::AppError => 1,
+            Status::Busy => 2,
+            Status::Moved => 3,
+            Status::NotFound => 4,
+            Status::DeadlineExceeded => 5,
+            Status::Denied => 6,
+            Status::RateLimited => 7,
+            Status::Unavailable => 8,
+            Status::Internal => 9,
+            Status::Trapped => 10,
+            Status::BadRequest => 11,
+            Status::Unknown(other) => other,
         }
     }
 

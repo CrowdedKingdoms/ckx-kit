@@ -70,7 +70,30 @@ ckx_sdk::export_hub!(GridMod);
 
 #[cfg(test)]
 mod tests {
+    use ckx_sdk::testing::{FakeGrid, TestHub};
+
     use super::*;
+
+    #[test]
+    fn visitors_are_welcomed_and_the_mod_reaches_no_other_node() {
+        let grid = FakeGrid::new(7, ChunkPos::new(0, 0, 0), ChunkPos::new(3, 1, 3), 42);
+        let mut m = TestHub::<GridMod>::mod_on("grid-mod", grid).unwrap();
+        let hello: String = m.call_typed(Caller::Player(9), "visit", &()).unwrap();
+        assert_eq!(hello, "welcome to grid 7, visitor 1");
+        let refusal: Option<String> = m.call_typed(Caller::Player(9), "probe", &()).unwrap();
+        assert_eq!(refusal.as_deref(), Some("Denied: `mod:grid-mod` may not call `world`"));
+        assert_eq!(m.call(Caller::Instance(1), "visit", &[]).unwrap_err().status, Status::Denied, "only players call mods");
+    }
+
+    #[test]
+    fn world_events_are_kept_across_a_restart() {
+        let grid = FakeGrid::new(7, ChunkPos::new(0, 0, 0), ChunkPos::new(3, 1, 3), 42);
+        let mut m = TestHub::<GridMod>::mod_on("grid-mod", grid).unwrap();
+        m.world(&[WorldEvent { grid: 7, kind: WorldEvent::VOXELS.into(), chunk: [1, 0, 1] }]).unwrap();
+        assert_eq!((m.hub().voxels, m.persist_asked()), (1, 1));
+        m.restart().unwrap();
+        assert_eq!(m.hub().last_chunk, Some([1, 0, 1]));
+    }
 
     #[test]
     fn world_events_are_counted_by_kind() {

@@ -1,6 +1,7 @@
 //! Glue between the exports the macros generate and the developer's node type.
 
 use std::alloc::{Layout, alloc as raw_alloc, dealloc};
+#[cfg(target_arch = "wasm32")]
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,10 +26,13 @@ const ENVELOPE: &[u8] = b"\xc1ckx2";
 
 /// A guest is single threaded; the host never calls in while a call is running, except
 /// `ckx_alloc`, which touches none of these.
+#[cfg(target_arch = "wasm32")]
 struct GuestCell<T>(UnsafeCell<T>);
 
+#[cfg(target_arch = "wasm32")]
 unsafe impl<T> Sync for GuestCell<T> {}
 
+#[cfg(target_arch = "wasm32")]
 impl<T> GuestCell<T> {
     const fn new(v: T) -> Self {
         Self(UnsafeCell::new(v))
@@ -38,6 +42,42 @@ impl<T> GuestCell<T> {
     fn get(&self) -> &mut T {
         unsafe { &mut *self.0.get() }
     }
+}
+
+/// Natively each thread is a guest of its own, so tests on parallel threads run a node each.
+#[cfg(not(target_arch = "wasm32"))]
+struct GuestCell<T: 'static>(fn() -> T);
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static GUEST: std::cell::RefCell<std::collections::HashMap<usize, Box<dyn std::any::Any>>> = Default::default();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: 'static> GuestCell<T> {
+    const fn new(init: fn() -> T) -> Self {
+        Self(init)
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn get(&self) -> &mut T {
+        let key = self as *const Self as usize;
+        GUEST.with(|cells| {
+            let mut cells = cells.borrow_mut();
+            let cell = cells.entry(key).or_insert_with(|| Box::new((self.0)()));
+            let ptr: *mut T = cell.downcast_mut::<T>().expect("one type per cell");
+            unsafe { &mut *ptr }
+        })
+    }
+}
+
+macro_rules! guest_static {
+    ($name:ident: $t:ty = $init:expr) => {
+        #[cfg(target_arch = "wasm32")]
+        static $name: GuestCell<$t> = GuestCell::new($init);
+        #[cfg(not(target_arch = "wasm32"))]
+        static $name: GuestCell<$t> = GuestCell::new(|| $init);
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +123,7 @@ impl Platform {
     }
 }
 
-static PLATFORM: GuestCell<Platform> = GuestCell::new(Platform { timers: BTreeMap::new(), watches: BTreeSet::new(), wake: 0 });
+guest_static!(PLATFORM: Platform = Platform { timers: BTreeMap::new(), watches: BTreeSet::new(), wake: 0 });
 
 fn wrap(p: &Platform, state: &[u8]) -> Result<Vec<u8>> {
     let head = encode(p)?;
@@ -217,6 +257,17 @@ fn parse_topic(b: &[u8]) -> Result<TopicMsg<'_>> {
     Ok(TopicMsg { node_type, key, topic, payload: &b[at + 1 + tplen..] })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Hub> HubNode<T> {
+    pub(crate) fn hub(&self) -> &T {
+        &self.0
+    }
+
+    pub(crate) fn hub_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 impl<T: Hub> HubNode<T> {
     fn platform_call(&mut self, ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
         use ckx_platform::*;
@@ -253,8 +304,8 @@ impl<T: Hub> HubNode<T> {
     }
 }
 
-/// Reserved method names, as `ckx_proto::platform` defines them.
-mod ckx_platform {
+/// The platform's reserved method names: its events.
+pub(crate) mod ckx_platform {
     pub const TIMER: &str = "$timer";
     pub const TOPIC: &str = "$topic";
     pub const PRESENCE: &str = "$presence";
@@ -307,6 +358,17 @@ impl<T: Hub> Node for HubNode<T> {
 
 pub struct SpokeNode<T: Spoke>(T);
 
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Spoke> SpokeNode<T> {
+    pub(crate) fn spoke(&self) -> &T {
+        &self.0
+    }
+
+    pub(crate) fn spoke_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 impl<T: Spoke> Node for SpokeNode<T> {
     fn init(ctx: &Ctx, _seed: &[u8], _snapshot: Option<(&[u8], u64)>) -> Result<Self> {
         Ok(Self(T::start(ctx)?))
@@ -326,8 +388,8 @@ impl<T: Spoke> Node for SpokeNode<T> {
     fn evict(&mut self, _ctx: &Ctx) {}
 }
 
-static NODE: GuestCell<Option<(Ctx, Box<dyn DynNode>)>> = GuestCell::new(None);
-static OUT: GuestCell<Vec<u8>> = GuestCell::new(Vec::new());
+guest_static!(NODE: Option<(Ctx, Box<dyn DynNode>)> = None);
+guest_static!(OUT: Vec<u8> = Vec::new());
 
 fn layout(len: u32) -> Layout {
     Layout::from_size_align(len as usize, 1).expect("valid layout")
@@ -383,15 +445,24 @@ fn respond(result: Result<Vec<u8>>) -> u64 {
 
 /// Unpacks a result the host returned from an import.
 pub(crate) fn import_result(packed: u64) -> Result<Vec<u8>, CallError> {
-    let (ptr, len) = ((packed >> 32) as u32, packed as u32);
-    if len == 0 {
+    let Some(buf) = imported(packed) else {
         return Err(CallError { status: Status::Internal, message: "no reply from the host".into() });
-    }
-    let buf = take(ptr, len);
+    };
     match Status::from_u8(buf[0]) {
         Status::Ok => Ok(buf[1..].to_vec()),
         status => Err(CallError { status, message: String::from_utf8_lossy(&buf[1..]).into_owned() }),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn imported(packed: u64) -> Option<Vec<u8>> {
+    let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+    (len != 0).then(|| take(ptr, len))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn imported(packed: u64) -> Option<Vec<u8>> {
+    if packed == 0 { None } else { abi::native::take_result().filter(|b| !b.is_empty()) }
 }
 
 fn parse_ctx(b: &[u8]) -> Result<Ctx> {

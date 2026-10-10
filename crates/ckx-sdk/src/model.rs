@@ -1,4 +1,4 @@
-//! Typed state for a hub (HS-27): what the legacy game models kept in the database, kept in the
+//! Typed state for a hub: what the legacy game models kept in the database, kept in the
 //! hub instead. Containers of declared types hold typed properties with defaults, edges relate
 //! them, and each property's visibility decides what a player may read.
 //!

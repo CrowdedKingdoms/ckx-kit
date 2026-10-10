@@ -34,6 +34,8 @@ ckx_sdk::export_spoke!(Combat);
 
 #[cfg(test)]
 mod tests {
+    use ckx_sdk::testing::TestSpoke;
+
     use super::*;
 
     #[test]
@@ -44,10 +46,8 @@ mod tests {
 
     #[test]
     fn the_endpoint_answers_in_messagepack() {
-        let ctx = Ctx { app: 1, instance: 1, epoch: 1, version: 1, kind: Kind::Spoke, node_type: "combat".into(), key: String::new() };
-        let mut spoke = Combat::start(&ctx).unwrap();
-        let hit = encode(&Hit { attack: 10, defense: 4 }).unwrap();
-        let reply = spoke.handle(&ctx, Call { caller: Caller::Instance(3), method: "damage", payload: &hit }).unwrap();
-        assert_eq!(decode::<u32>(&reply).unwrap(), 8);
+        let mut spoke = TestSpoke::<Combat>::start("combat").unwrap();
+        let hurt: u32 = spoke.call_typed(Caller::Instance(3), "damage", &Hit { attack: 10, defense: 4 }).unwrap();
+        assert_eq!(hurt, 8);
     }
 }
