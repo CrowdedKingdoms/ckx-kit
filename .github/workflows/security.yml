@@ -1,0 +1,75 @@
+# Security gates (the org's security-hardening program, 2026-09-08).
+#
+#   gitleaks    secrets in the working tree           BLOCKING
+#   npm audit   high/critical advisories              report-only until the baseline is clean
+#   CodeQL      static analysis                       alerts in the Security tab
+#
+# Runs on every PR and push to the tier branches, and weekly so a new advisory against an
+# unchanged tree is still seen.
+name: security
+on:
+  pull_request:
+  push:
+    branches: [dev, test, prod]
+  schedule:
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    name: secrets (gitleaks, working tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: gitleaks
+        # The WORKING TREE at this commit, not the history: a historical leak is a rotation task
+        # for the operator, not a reason to block every PR. The tree scan is BLOCKING.
+        run: |
+          set -euo pipefail
+          bash scripts/ci/install-gitleaks.sh
+          ./gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+  gitleaks-history:
+    name: secrets (gitleaks, every commit)
+    # The whole history, weekly and on demand: a public repository's history is as readable as
+    # its tree.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: gitleaks over the history
+        run: |
+          set -euo pipefail
+          bash scripts/ci/install-gitleaks.sh
+          ./gitleaks detect --source . --log-opts=--all --config .gitleaks.toml --redact --no-banner --exit-code 1
+  npm-audit:
+    name: dependencies (npm audit, high+)
+    runs-on: ubuntu-latest
+    # REPORT-ONLY for now: the job passes and annotates. Flip to blocking by removing the
+    # `|| echo` once the baseline is clean. The package has no runtime dependencies; this audits
+    # the build and test toolchain.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: npm audit --audit-level=high || echo "::warning::npm audit found high/critical advisories (report-only until the baseline is clean)"
+  codeql:
+    name: SAST (CodeQL)
+    # Code scanning needs the repository public (or Advanced Security); it was private until its
+    # first security review.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:javascript-typescript

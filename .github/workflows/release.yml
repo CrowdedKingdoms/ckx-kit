@@ -1,0 +1,221 @@
+name: Release
+
+run-name: release ${{ github.ref_name }}
+
+# A release is an environment-prefixed tag on one of the three long-lived branches:
+# `dev/v0.1.0`, `test/v0.1.0`, `prod/v0.1.0`. The tier is the prefix, and the `guard` job refuses
+# a tag whose commit is not contained in the branch it names.
+#
+# It publishes, by trusted publishing (OIDC; this repository holds no registry token):
+#   - the two SDK crates to crates.io, each only when its source is new for the tier
+#     (scripts/ci/publish-crates.mjs): X.Y.Z-dev.N on dev, X.Y.Z-test.N on test, X.Y.Z on prod;
+#   - the CLI to npm: X.Y.Z-dev.N under @dev, X.Y.Z-test.N under @test, X.Y.Z under @latest
+#     (scripts/ci/resolve-npm-publish-version.mjs);
+# then a GitHub release, and a smoke test on a fresh runner from the published packages alone.
+#
+# The trusted publishers on crates.io and npmjs.com name this repository, this workflow file
+# and the `release` environment, which only `dev/v*`, `test/v*` and `prod/v*` tags may use.
+on:
+  push:
+    tags:
+      - 'dev/v*.*.*'
+      - 'test/v*.*.*'
+      - 'prod/v*.*.*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tier: ${{ steps.gate.outputs.tier }}
+      version: ${{ steps.gate.outputs.version }}
+    steps:
+      # fetch-depth: 0 and persisted credentials are both required: the gate runs `git fetch
+      # origin` and a merge-base containment check against the tier branch.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: gate
+        run: scripts/ci/resolve-release-tier.sh
+      - name: The tag names the version package.json declares
+        env:
+          TAG_VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          declared="$(node -p "require('./package.json').version")"
+          tagged="${TAG_VERSION#v}"
+          if [ "$declared" != "$tagged" ]; then
+            echo "::error::tag names $tagged but package.json says $declared. Bump package.json and re-tag that commit."
+            exit 1
+          fi
+
+  build:
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish the crates and the CLI
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # crates.io and npm trusted publishing, and npm provenance
+    outputs:
+      npm_version: ${{ steps.publish.outputs.publish_version }}
+    env:
+      TIER: ${{ needs.guard.outputs.tier }}
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: The pinned Rust (cargo publish verifies each crate by building it)
+        run: rustup toolchain install "$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)" --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      # npm trusted publishing requires npm 11.5.1 or later; pinned, and moved on purpose.
+      - name: npm for trusted publishing
+        run: npm install -g npm@11.21.0
+      - run: npm ci
+
+      - name: Decide which crates are new for this tier
+        id: crates
+        run: node scripts/ci/publish-crates.mjs plan "$TIER"
+      - name: A crates.io token for this run (trusted publishing)
+        if: steps.crates.outputs.needs_token == 'true'
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish the new crates; stamp each crate's tier version
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: node scripts/ci/publish-crates.mjs publish "$TIER"
+
+      - name: Read the CLI's published versions from the registry
+        run: |
+          set -euo pipefail
+          if raw=$(npm view @crowdedkingdoms/ckx-kit versions --json 2>"$RUNNER_TEMP/npm-view.err"); then
+            :
+          elif grep -qE 'E404|is not in this registry' "$RUNNER_TEMP/npm-view.err"; then
+            raw='[]'
+          else
+            cat "$RUNNER_TEMP/npm-view.err" >&2
+            echo "::error::could not read the registry; refusing to guess the next version."
+            exit 1
+          fi
+          printf '%s' "$raw" > "$RUNNER_TEMP/registry-versions.json"
+      - name: Resolve the CLI's version and dist-tag
+        id: resolve
+        run: node scripts/ci/resolve-npm-publish-version.mjs "$TIER" "${VERSION#v}" < "$RUNNER_TEMP/registry-versions.json"
+      - name: Stamp the package with that version
+        env:
+          PUBLISH_VERSION: ${{ steps.resolve.outputs.publish_version }}
+        run: npm version "$PUBLISH_VERSION" --no-git-tag-version --allow-same-version
+      - run: npm run build
+      - name: What is about to be uploaded holds what the CLI needs, and no private reference
+        run: |
+          set -euo pipefail
+          node scripts/ci/check-pack.mjs
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/staged"
+          tar -xzf "$RUNNER_TEMP"/crowdedkingdoms-ckx-kit-*.tgz -C "$RUNNER_TEMP/staged"
+          node scripts/ci/check-content-policy.mjs "$RUNNER_TEMP/staged/package"
+      - name: Publish the CLI
+        id: publish
+        env:
+          DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
+          PUBLISH_VERSION: ${{ steps.resolve.outputs.publish_version }}
+        # A version npm staged but never published is used up, and `npm view` does not list it:
+        # on dev and test the next ordinal is tried instead (a few times at most).
+        run: |
+          set -euo pipefail
+          version="$PUBLISH_VERSION"
+          for attempt in 1 2 3 4 5; do
+            if npm publish --provenance --access public --tag "$DIST_TAG" 2>"$RUNNER_TEMP/publish.err"; then
+              echo "publish_version=$version" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/publish.err" >&2
+            if [ "$TIER" = prod ] || ! grep -qiE 'previously (staged|published) version' "$RUNNER_TEMP/publish.err"; then
+              exit 1
+            fi
+            base="${version%-*}"; n="${version##*.}"
+            version="${base}-${TIER}.$((n + 1))"
+            echo "::notice::$base-$TIER.$n is used up on npm; trying $version"
+            npm version "$version" --no-git-tag-version --allow-same-version
+          done
+          exit 1
+      - name: What the registry now serves
+        env:
+          PUBLISH_VERSION: ${{ steps.publish.outputs.publish_version }}
+          DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if npm view "@crowdedkingdoms/ckx-kit@$PUBLISH_VERSION" version >/dev/null 2>&1; then
+              echo "dist-tag $DIST_TAG -> $(npm view "@crowdedkingdoms/ckx-kit@$DIST_TAG" version)"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::npm accepted $PUBLISH_VERSION but does not serve it after 15 minutes"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_VERSION: ${{ steps.publish.outputs.publish_version }}
+          DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          version_of() { grep -m1 -oP '^version = "\K[^"]+' "crates/$1/Cargo.toml"; }
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          - npm: \`@crowdedkingdoms/ckx-kit@$PUBLISH_VERSION\` (dist-tag \`$DIST_TAG\`)
+          - crates.io: \`ckx-sdk $(version_of ckx-sdk)\`, \`crowdy-client-sdk $(version_of crowdy-client-sdk)\`
+          - builds as the platform's compute toolchain $(grep -oP '^toolchain_version=\K.*' kit.pin) on $TIER (Rust $(grep -oP '^rust_version=\K.*' kit.pin))
+          EOF
+          prerelease=""
+          [ "$TIER" = prod ] || prerelease="--prerelease"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" $prerelease
+
+  smoke:
+    name: From the published packages alone, on a fresh runner
+    needs: [guard, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {}
+    env:
+      KIT: "@crowdedkingdoms/ckx-kit@${{ needs.publish.outputs.npm_version }}"
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: binaryen (wasm-opt)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+      - name: A mod, its tests against the published ckx-sdk, and its build
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          npx --yes "$KIT" new mod smoke-mod
+          cd smoke-mod
+          # What the docs tell a developer: the Rust release the project's rust-toolchain.toml pins.
+          rustup toolchain install "$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)" --profile minimal --target wasm32-unknown-unknown
+          cargo test
+          npx --yes "$KIT" build --mod
+      - name: A CLIENT half, its tests and its build
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          npx --yes "$KIT" new client smoke-hud
+          cd smoke-hud
+          cargo test
+          npx --yes "$KIT" build --client
+      - run: npx --yes "$KIT" doctor
