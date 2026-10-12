@@ -1,0 +1,16 @@
+[package]
+name = "client-half"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# How often visitors' browsers call tick (clamped 16–1000 ms).
+# 1000 = HUD/text. 50 = physics minigames (pool). 16 = shooters, if a tick stays cheap.
+[package.metadata.crowdy]
+tick_interval_ms = 1000
+
+[dependencies]
+crowdy-client-sdk = "0.1.0"
+serde_json = "1"

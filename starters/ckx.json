@@ -1,0 +1,9 @@
+{
+  "root": "world",
+  "types": {
+    "world": { "kind": "hub", "crate": "world-tick", "wasm": "world_tick.wasm", "client": true, "persist_every_ms": 10000 },
+    "matchmaker": { "kind": "hub", "parent": "world", "crate": "matchmaker", "wasm": "matchmaker.wasm", "client": true, "calls": ["session"] },
+    "session": { "kind": "hub", "parent": "matchmaker", "crate": "session", "wasm": "session.wasm", "client": true },
+    "npcs": { "kind": "hub", "parent": "world", "crate": "npc-mobs", "wasm": "npc_mobs.wasm", "client": true, "calls": ["world"], "scopes": ["world.read"] }
+  }
+}

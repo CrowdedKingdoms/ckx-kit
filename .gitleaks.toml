@@ -1,0 +1,17 @@
+# gitleaks configuration: the default ruleset plus an allowlist for the classes of string that
+# are not secrets here. A NEW allowlist entry is a reviewed decision -- say in the PR why the
+# string cannot be a live credential.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures, generated output and crate checksums"
+paths = [
+  # Specs and fixtures: fake values with the right shape are the point of them.
+  '''\.(spec|test)\.(ts|mjs|js)$''',
+  '''(^|/)(test|tests|__tests__|fixtures)/''',
+  # Generated output, never a place a credential is written.
+  '''(^|/)dist/''',
+  # Lockfiles: registry checksums of published crates and packages.
+  '''(^|/)(vendor\.lock|Cargo\.lock|package-lock\.json)$''',
+]
