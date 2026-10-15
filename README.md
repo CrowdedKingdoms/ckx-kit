@@ -45,6 +45,15 @@ on the platform: Crowdy Studio, or `execModBuild` then `execModDeploy` (see
 `CKX_KIT_TARGET_DIR` shares one cargo target directory between crates, so their dependencies
 compile once.
 
+## The game kit
+
+`ckx_sdk::kit` (from `ckx-sdk` 0.10.0) is the server half of the Crowded Kingdoms game kit: the
+protocol a kit hub speaks to the kit clients in CrowdyJS, CrowdyCPP and CrowdyPy (topic messages
+that carry a sequence number and resync after a gap, actions a client may resend with an
+`action_id` that the hub answers once, refusals with a `kit:<code>:` code), shard keys, a seeded
+random generator and the realtime event registry. The starter pack crates speak it, so the kit
+clients' typed modules drive them as they are.
+
 ## Test
 
 `cargo test` runs your crate natively against `ckx_sdk::testing` (from `ckx-sdk` 0.9.0), which

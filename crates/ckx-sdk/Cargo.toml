@@ -1,6 +1,6 @@
 [package]
 name = "ckx-sdk"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "Write ck-exec hubs, spokes and mods for Crowded Kingdoms in Rust, compiled to wasm32-unknown-unknown"
 license = "MIT OR Apache-2.0"
