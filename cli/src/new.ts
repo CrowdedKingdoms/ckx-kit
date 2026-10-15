@@ -21,6 +21,8 @@ export const TEMPLATES: Record<string, { dir: string[]; sdk: Sdk; about: string 
   arena: { dir: ['starters', 'arena'], sdk: 'ckx-sdk', about: 'classes and abilities in real time' },
   racing: { dir: ['starters', 'racing'], sdk: 'ckx-sdk', about: 'races with laps and a ghost, and ball games' },
   territory: { dir: ['starters', 'territory'], sdk: 'ckx-sdk', about: 'control points, and a shrinking circle' },
+  player: { dir: ['starters', 'player'], sdk: 'ckx-sdk', about: "a player's own hub: items, currency, crafting, quests (not a ledger)" },
+  market: { dir: ['starters', 'market'], sdk: 'ckx-sdk', about: 'vendors, an order book, trades between players (not a ledger)' },
 };
 
 const CRATE_NAME = /^[a-z][a-z0-9_-]{0,63}$/;

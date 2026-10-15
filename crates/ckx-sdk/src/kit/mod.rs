@@ -28,7 +28,9 @@
 //! answer instead of running twice.
 //!
 //! A refusal's message starts with a code, `kit:<code>: <text>` ([`error`], [`error_code`]),
-//! which clients branch on without reading prose. [`codes`] has the common ones.
+//! which clients branch on without reading prose. [`codes`] has the common ones. One of them,
+//! [`codes::UNAVAILABLE`], says the call needed another hub that did not answer: receipts never
+//! keep it, so the call runs again when it is sent again with its `action_id`.
 //!
 //! ```ignore
 //! use ckx_sdk::kit::{self, MessageKind, Publisher, Receipts};
@@ -61,6 +63,7 @@ use crate::model::{Model, Published, Schema, Viewer};
 use crate::{Call, Caller, Ctx, Error, Result, decode, encode};
 
 pub mod ai;
+pub mod econ;
 pub mod play;
 pub mod presence;
 pub mod rng;
@@ -290,6 +293,9 @@ pub mod codes {
     pub const INSUFFICIENT: &str = "insufficient";
     /// The action already ran; its reply was too large to keep ([`super::RECEIPT_REPLY_MAX`]).
     pub const ALREADY_DONE: &str = "already_done";
+    /// Another hub this call needs did not answer in time, so the call did not finish: send it
+    /// again with the same `action_id`. Receipts never keep it.
+    pub const UNAVAILABLE: &str = "unavailable";
 }
 
 /// A refusal with a code: its message is `kit:<code>: <text>`.
@@ -382,9 +388,15 @@ impl Receipts {
         })
     }
 
-    /// Keeps what `caller` got for `action_id`; nothing without an action id.
+    /// Keeps what `caller` got for `action_id`; nothing without an action id, and nothing for a
+    /// refusal coded [`codes::UNAVAILABLE`], which says the action did not finish.
     pub fn record(&mut self, caller: Caller, action_id: Option<&str>, result: &Result<Vec<u8>>, now: u64) {
         let (Some(who), Some(id)) = (caller_key(caller), action_id) else { return };
+        if let Err(Error(message)) = result
+            && error_code(message).is_some_and(|(c, _)| c == codes::UNAVAILABLE)
+        {
+            return;
+        }
         while self.kept.front().is_some_and(|r| now.saturating_sub(r.at) >= RECEIPT_TTL_MS) || self.kept.len() >= RECEIPTS_MAX {
             self.kept.pop_front();
         }
@@ -439,6 +451,15 @@ mod tests {
         // An older reader of the body alone still reads it.
         assert_eq!(decode::<Cells>(&bytes).unwrap(), Cells { cells: vec![1, 2] });
         assert!(message(&ctx(), MessageKind::Event, 1, &vec![1u8]).is_err(), "a body is a struct or a map");
+    }
+
+    #[test]
+    fn a_refusal_coded_unavailable_is_not_a_receipt() {
+        let mut r = Receipts::new();
+        r.record(Caller::Player(1), Some("a1"), &Err(error(codes::UNAVAILABLE, "the player's hub did not answer")), 0);
+        assert!(r.replay(Caller::Player(1), Some("a1"), 1).is_none(), "sent again, it runs again");
+        r.record(Caller::Player(1), Some("a1"), &Err(error(codes::INSUFFICIENT, "not enough gold")), 2);
+        assert!(r.replay(Caller::Player(1), Some("a1"), 3).is_some(), "a refusal that ran is kept");
     }
 
     #[test]

@@ -15,6 +15,8 @@
     "race": { "kind": "hub", "parent": "world", "crate": "racing", "wasm": "racing.wasm", "client": true, "calls": ["leaderboard"] },
     "ball": { "kind": "hub", "parent": "world", "crate": "racing", "wasm": "racing.wasm", "client": true },
     "territory": { "kind": "hub", "parent": "world", "crate": "territory", "wasm": "territory.wasm", "client": true, "scopes": ["world.read"] },
-    "zone": { "kind": "hub", "parent": "world", "crate": "territory", "wasm": "territory.wasm", "client": true, "scopes": ["world.read"] }
+    "zone": { "kind": "hub", "parent": "world", "crate": "territory", "wasm": "territory.wasm", "client": true, "scopes": ["world.read"] },
+    "player": { "kind": "hub", "parent": "world", "crate": "player", "wasm": "player.wasm", "client": true },
+    "market": { "kind": "hub", "parent": "world", "crate": "market", "wasm": "market.wasm", "client": true, "calls": ["player"] }
   }
 }
