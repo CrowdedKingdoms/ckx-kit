@@ -41,6 +41,16 @@ impl Rng {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// Uniform in `[0, 1)`, single precision.
+    pub fn f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Uniform in `[lo, hi]`, both included: [`Rng::range`].
+    pub fn range_i64(&mut self, lo: i64, hi: i64) -> i64 {
+        self.range(lo, hi)
+    }
+
     /// Uniform in `[0, n)`; 0 when `n` is 0.
     pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next_u64() % n }

@@ -12,6 +12,15 @@ export const TEMPLATES: Record<string, { dir: string[]; sdk: Sdk; about: string 
   matchmaker: { dir: ['starters', 'matchmaker'], sdk: 'ckx-sdk', about: 'a rating queue that reserves sessions' },
   session: { dir: ['starters', 'session'], sdk: 'ckx-sdk', about: 'one game from lobby to result' },
   'npc-mobs': { dir: ['starters', 'npc-mobs'], sdk: 'ckx-sdk', about: "an area's mobs and NPCs" },
+  leaderboard: { dir: ['starters', 'leaderboard'], sdk: 'ckx-sdk', about: 'a board other hubs submit to, with seasons' },
+  deck: { dir: ['starters', 'deck'], sdk: 'ckx-sdk', about: 'a card table with hands only their player reads' },
+  tactics: { dir: ['starters', 'tactics'], sdk: 'ckx-sdk', about: "a grid battle in phases against the hub's units" },
+  director: { dir: ['starters', 'director'], sdk: 'ckx-sdk', about: 'waves down a lane, towers, a boss with phases' },
+  minigame: { dir: ['starters', 'minigame'], sdk: 'ckx-sdk', about: 'a duel of hidden throws, revealed together' },
+  instance: { dir: ['starters', 'instance'], sdk: 'ckx-sdk', about: "a party's private run: seeded floors, permadeath" },
+  arena: { dir: ['starters', 'arena'], sdk: 'ckx-sdk', about: 'classes and abilities in real time' },
+  racing: { dir: ['starters', 'racing'], sdk: 'ckx-sdk', about: 'races with laps and a ghost, and ball games' },
+  territory: { dir: ['starters', 'territory'], sdk: 'ckx-sdk', about: 'control points, and a shrinking circle' },
 };
 
 const CRATE_NAME = /^[a-z][a-z0-9_-]{0,63}$/;
