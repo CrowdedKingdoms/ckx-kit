@@ -4,6 +4,17 @@
     "world": { "kind": "hub", "crate": "world-tick", "wasm": "world_tick.wasm", "client": true, "persist_every_ms": 10000 },
     "matchmaker": { "kind": "hub", "parent": "world", "crate": "matchmaker", "wasm": "matchmaker.wasm", "client": true, "calls": ["session"] },
     "session": { "kind": "hub", "parent": "matchmaker", "crate": "session", "wasm": "session.wasm", "client": true },
-    "npcs": { "kind": "hub", "parent": "world", "crate": "npc-mobs", "wasm": "npc_mobs.wasm", "client": true, "calls": ["world"], "scopes": ["world.read"] }
+    "npcs": { "kind": "hub", "parent": "world", "crate": "npc-mobs", "wasm": "npc_mobs.wasm", "client": true, "calls": ["world"], "scopes": ["world.read"] },
+    "leaderboard": { "kind": "hub", "parent": "world", "crate": "leaderboard", "wasm": "leaderboard.wasm", "client": true },
+    "deck": { "kind": "hub", "parent": "world", "crate": "deck", "wasm": "deck.wasm", "client": true },
+    "tactics": { "kind": "hub", "parent": "world", "crate": "tactics", "wasm": "tactics.wasm", "client": true },
+    "director": { "kind": "hub", "parent": "world", "crate": "director", "wasm": "director.wasm", "client": true },
+    "minigame": { "kind": "hub", "parent": "world", "crate": "minigame", "wasm": "minigame.wasm", "client": true },
+    "instance": { "kind": "hub", "parent": "world", "crate": "instance", "wasm": "instance.wasm", "client": true, "calls": ["leaderboard"] },
+    "arena": { "kind": "hub", "parent": "world", "crate": "arena", "wasm": "arena.wasm", "client": true },
+    "race": { "kind": "hub", "parent": "world", "crate": "racing", "wasm": "racing.wasm", "client": true, "calls": ["leaderboard"] },
+    "ball": { "kind": "hub", "parent": "world", "crate": "racing", "wasm": "racing.wasm", "client": true },
+    "territory": { "kind": "hub", "parent": "world", "crate": "territory", "wasm": "territory.wasm", "client": true, "scopes": ["world.read"] },
+    "zone": { "kind": "hub", "parent": "world", "crate": "territory", "wasm": "territory.wasm", "client": true, "scopes": ["world.read"] }
   }
 }

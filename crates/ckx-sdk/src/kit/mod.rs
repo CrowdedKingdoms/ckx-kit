@@ -60,8 +60,12 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Model, Published, Schema, Viewer};
 use crate::{Call, Caller, Ctx, Error, Result, decode, encode};
 
+pub mod ai;
+pub mod play;
+pub mod presence;
 pub mod rng;
 pub mod shard;
+pub mod sim;
 pub mod wire;
 
 pub use rng::Rng;
@@ -131,8 +135,19 @@ struct Outgoing<'a, T: ?Sized> {
     body: &'a T,
 }
 
-/// Encodes one kit message from this instance. `body` must serialize as a struct or a map.
+/// The fields a kit message's header owns; a body may not use them (they sit side by side).
+pub const RESERVED_FIELDS: [&str; 4] = ["v", "epoch", "seq", "kind"];
+
+/// Encodes one kit message from this instance. `body` must serialize as a struct or a map, and
+/// none of its fields may be one of [`RESERVED_FIELDS`]: a debug build (`cargo test`) refuses a
+/// body that uses one, which would leave a client two `kind`s to choose from.
 pub fn message<T: Serialize + ?Sized>(ctx: &Ctx, kind: MessageKind, seq: u64, body: &T) -> Result<Vec<u8>> {
+    #[cfg(debug_assertions)]
+    if let Ok(fields) = decode::<BTreeMap<String, serde::de::IgnoredAny>>(&encode(body)?)
+        && let Some(taken) = RESERVED_FIELDS.iter().find(|f| fields.contains_key(**f))
+    {
+        return Err(Error::new(format!("a kit message's body may not have a field `{taken}`: the header owns it")));
+    }
     let header = Header { v: PROTOCOL, epoch: ctx.epoch, seq, kind };
     encode(&Outgoing { header, body })
 }
@@ -235,6 +250,15 @@ pub fn snapshot_topic(call: &Call<'_>, default: &str) -> String {
 /// A call's arguments, refused with [`codes::BAD_REQUEST`] when they do not decode.
 pub fn args<T: DeserializeOwned>(call: &Call<'_>) -> Result<T> {
     decode(call.payload).map_err(|Error(e)| error(codes::BAD_REQUEST, format!("`{}`: {e}", call.method)))
+}
+
+/// A call's arguments when it may send none: an empty payload or a nil (what a client sends for
+/// no arguments) is `T::default()`.
+pub fn args_or_default<T: DeserializeOwned + Default>(call: &Call<'_>) -> Result<T> {
+    match call.payload {
+        [] | [0xc0] => Ok(T::default()),
+        _ => args(call),
+    }
 }
 
 // ---- refusals ----
@@ -418,6 +442,13 @@ mod tests {
     }
 
     #[test]
+    fn a_body_may_not_use_a_field_the_header_owns() {
+        let e = message(&ctx(), MessageKind::Event, 1, &serde_json::json!({ "type": "timing", "kind": "lap" })).unwrap_err();
+        assert!(e.0.contains("`kind`"), "{}", e.0);
+        assert!(message(&ctx(), MessageKind::Event, 1, &serde_json::json!({ "type": "timing", "stage": "lap" })).is_ok());
+    }
+
+    #[test]
     fn each_topic_counts_its_own_messages_and_a_snapshot_reply_names_the_last() {
         let mut p = Publisher::new();
         assert_eq!(p.seq("board"), 0);
@@ -478,6 +509,23 @@ mod tests {
         assert_eq!(Receipts::action_id(&encode(&5u8).unwrap()).unwrap(), None);
         let long = "x".repeat(ACTION_ID_MAX + 1);
         assert!(Receipts::action_id(&encode(&Act { points: 1, action_id: &long }).unwrap()).is_err());
+    }
+
+    #[test]
+    fn no_arguments_are_the_defaults_and_bad_ones_are_a_bad_request() {
+        #[derive(Deserialize, Default, Debug, PartialEq)]
+        #[serde(default)]
+        struct Open {
+            seed: Option<u64>,
+        }
+        let call = |payload: &'static [u8]| Call { caller: Caller::Player(1), method: "open", payload };
+        assert_eq!(args_or_default::<Open>(&call(&[])).unwrap(), Open::default());
+        assert_eq!(args_or_default::<Open>(&call(&[0xc0])).unwrap(), Open::default());
+        let given = encode(&serde_json::json!({ "seed": 4 })).unwrap();
+        let c = Call { caller: Caller::Player(1), method: "open", payload: &given };
+        assert_eq!(args_or_default::<Open>(&c).unwrap(), Open { seed: Some(4) });
+        let Error(e) = args_or_default::<Open>(&call(&[0x05])).unwrap_err();
+        assert_eq!(error_code(&e).map(|c| c.0), Some(codes::BAD_REQUEST));
     }
 
     #[test]
