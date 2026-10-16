@@ -209,6 +209,11 @@ impl Model {
         self.containers.get(&id)
     }
 
+    /// Every container's id, oldest first.
+    pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.containers.keys().copied()
+    }
+
     /// Every container of `type_name`, oldest first.
     pub fn of_type<'a>(&'a self, type_name: &'a str) -> impl Iterator<Item = u64> + 'a {
         self.containers.iter().filter(move |(_, c)| c.type_name == type_name).map(|(id, _)| *id)
