@@ -6,16 +6,20 @@
 //!
 //! Endpoints (players): `join`, `leave`, `ready { ready }`, `start` (host), `act { points }`
 //! (the player whose turn it is), `state` (anyone). `configure { .. }` (the host in the lobby,
-//! or a developer) and `reserve { players }` (another instance, or a developer). Every change
-//! is pushed on the `session` topic.
+//! or a developer) and `reserve { players }` (another instance, or a developer). It speaks the
+//! kit protocol (`ckx_sdk::kit`): every change is a `snapshot` message on the `session` topic,
+//! `snapshot { topic: "session" }` answers the same, a call that changes something may carry
+//! an `action_id`, and refusals carry `kit:<code>:` codes.
 //!
 //! [`points_for`] is the game's rule; replace it with yours.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use ckx_sdk::kit::{self, Publisher, Receipts, codes};
 use ckx_sdk::prelude::*;
 
 const LOG_MOVES: usize = 20;
+pub const TOPIC: &str = "session";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -60,7 +64,7 @@ pub struct Move {
 
 /// The game's rule for what a move scores. The starter's: 0 to 3 points, as asked.
 pub fn points_for(action: &Action) -> Result<i64> {
-    if (0..=3).contains(&action.points) { Ok(action.points) } else { Err(Error::new("a move scores 0 to 3 points")) }
+    if (0..=3).contains(&action.points) { Ok(action.points) } else { Err(kit::error("invalid_move", "a move scores 0 to 3 points")) }
 }
 
 #[derive(Deserialize)]
@@ -73,6 +77,7 @@ struct Reserve {
     players: Vec<u64>,
 }
 
+/// The session as everyone sees it: what `state` answers and the `session` topic carries.
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct GameSession {
     pub config: Config,
@@ -91,7 +96,8 @@ pub struct GameSession {
 }
 
 impl GameSession {
-    fn now_turn(&self) -> Option<u64> {
+    /// Whose turn it is, while the session plays.
+    pub fn now_turn(&self) -> Option<u64> {
         (self.phase == Phase::Playing).then(|| self.players.get(self.turn).copied()).flatten()
     }
 
@@ -100,13 +106,13 @@ impl GameSession {
             return Ok(());
         }
         if self.phase != Phase::Lobby {
-            return Err(Error::new("the session has started"));
+            return Err(kit::error(codes::STARTED, "the session has started"));
         }
         if !self.reserved.is_empty() && !self.reserved.contains(&player) {
-            return Err(Error::new("this session is reserved for other players"));
+            return Err(kit::error(codes::RESERVED, "this session is reserved for other players"));
         }
         if self.players.len() >= self.config.max_players {
-            return Err(Error::new("the session is full"));
+            return Err(kit::error(codes::FULL, "the session is full"));
         }
         self.players.push(player);
         self.scores.insert(player, 0);
@@ -145,16 +151,16 @@ impl GameSession {
 
     pub fn start(&mut self, player: u64) -> Result<()> {
         if self.phase != Phase::Lobby {
-            return Err(Error::new("the session has started"));
+            return Err(kit::error(codes::STARTED, "the session has started"));
         }
         if self.host != Some(player) {
-            return Err(Error::new("only the host starts the session"));
+            return Err(kit::error(codes::FORBIDDEN, "only the host starts the session"));
         }
         if self.players.len() < self.config.min_players {
-            return Err(Error::new(format!("at least {} players are needed", self.config.min_players)));
+            return Err(kit::error("too_few_players", format!("at least {} players are needed", self.config.min_players)));
         }
         if self.players.iter().any(|p| !self.ready.contains(p)) {
-            return Err(Error::new("everyone must be ready"));
+            return Err(kit::error(codes::NOT_READY, "everyone must be ready"));
         }
         self.phase = Phase::Playing;
         self.turn = 0;
@@ -165,7 +171,7 @@ impl GameSession {
     /// The current player's move, or a timeout (`action` None). Returns whether play goes on.
     pub fn play(&mut self, player: u64, action: Option<&Action>) -> Result<bool> {
         if self.now_turn() != Some(player) {
-            return Err(Error::new("it is not your turn"));
+            return Err(kit::error(codes::NOT_YOUR_TURN, "it is not your turn"));
         }
         let points = action.map(points_for).transpose()?;
         let score = self.scores.entry(player).or_insert(0);
@@ -201,15 +207,120 @@ impl GameSession {
             Ok(())
         }
     }
+
+    fn set_ready(&mut self, player: u64, ready: bool) -> Result<bool> {
+        if self.phase != Phase::Lobby || !self.players.contains(&player) {
+            return Err(kit::error(codes::NOT_MEMBER, "join the lobby first"));
+        }
+        if ready {
+            self.ready.insert(player);
+        } else {
+            self.ready.remove(&player);
+        }
+        Ok(ready)
+    }
+
+    fn configure(&mut self, caller: Caller, config: Config) -> Result<()> {
+        let allowed = match caller {
+            Caller::Developer(_) => true,
+            Caller::Player(p) => self.host == Some(p),
+            _ => false,
+        };
+        if !allowed || self.phase != Phase::Lobby {
+            return Err(kit::error(codes::FORBIDDEN, "the host configures the session in the lobby"));
+        }
+        if config.min_players < 1 || config.max_players < config.min_players || config.max_players > 64 {
+            return Err(kit::error(codes::BAD_REQUEST, "1 <= min_players <= max_players <= 64"));
+        }
+        if config.turn_ms < 1_000 {
+            return Err(kit::error(codes::BAD_REQUEST, "turn_ms is at least 1000"));
+        }
+        self.config = config;
+        Ok(())
+    }
+
+    fn reserve(&mut self, caller: Caller, players: Vec<u64>) -> Result<()> {
+        if !matches!(caller, Caller::Instance(_) | Caller::Developer(_)) {
+            return Err(kit::error(codes::FORBIDDEN, "reserve is for the matchmaker"));
+        }
+        if self.phase != Phase::Lobby || !self.players.is_empty() {
+            return Err(kit::error(codes::CONFLICT, "the session is already in use"));
+        }
+        if players.is_empty() || players.len() > self.config.max_players {
+            return Err(kit::error(codes::BAD_REQUEST, "reserve 1 to max_players players"));
+        }
+        self.reserved = players;
+        Ok(())
+    }
 }
 
-impl Hub for GameSession {
+/// The hub: the session, and what the kit protocol keeps beside it.
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct SessionHub {
+    #[serde(flatten)]
+    pub game: GameSession,
+    #[serde(default)]
+    pub kit: Publisher,
+    #[serde(default)]
+    pub receipts: Receipts,
+}
+
+impl SessionHub {
+    fn act(&mut self, ctx: &Ctx, call: &Call<'_>) -> Result<Vec<u8>> {
+        let game = &mut self.game;
+        let out = match call.method {
+            "join" => {
+                game.join(call.player()?)?;
+                ctx.cancel_timer("idle");
+                encode(&true)
+            }
+            "leave" => {
+                if game.leave(call.player()?) {
+                    game.arm_turn(ctx)?;
+                }
+                encode(&true)
+            }
+            "ready" => {
+                let req: Ready = kit::args(call)?;
+                encode(&game.set_ready(call.player()?, req.ready)?)
+            }
+            "start" => {
+                game.start(call.player()?)?;
+                game.arm_turn(ctx)?;
+                encode(&true)
+            }
+            "act" => {
+                let player = call.player()?;
+                let action: Action = kit::args(call)?;
+                let more = game.play(player, Some(&action))?;
+                game.arm_turn(ctx)?;
+                encode(&more)
+            }
+            "configure" => {
+                game.configure(call.caller, kit::args(call)?)?;
+                encode(&true)
+            }
+            "reserve" => {
+                let req: Reserve = kit::args(call)?;
+                game.reserve(call.caller, req.players)?;
+                encode(&true)
+            }
+            other => return Err(Error::unknown_method(other)),
+        };
+        self.kit.snapshot(ctx, TOPIC, &self.game)?;
+        ctx.persist_now();
+        out
+    }
+}
+
+impl Hub for SessionHub {
     fn spawn(ctx: &Ctx, _seed: &[u8]) -> Result<Self> {
         let s = Self::default();
-        ctx.timer_after("idle", s.config.lobby_idle_ms)?;
+        ctx.timer_after("idle", s.game.config.lobby_idle_ms)?;
         Ok(s)
     }
 
+    /// Reads this version's snapshots and the earlier ones, which held the session alone.
     fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> {
         decode(snapshot)
     }
@@ -219,122 +330,54 @@ impl Hub for GameSession {
     }
 
     fn handle(&mut self, ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
-        let out = match call.method {
-            "state" => return encode(&*self),
-            "join" => {
-                self.join(call.player()?)?;
-                ctx.cancel_timer("idle");
-                encode(&true)
-            }
-            "leave" => {
-                if self.leave(call.player()?) {
-                    self.arm_turn(ctx)?;
-                }
-                encode(&true)
-            }
-            "ready" => {
-                let player = call.player()?;
-                let req: Ready = call.decode()?;
-                if self.phase != Phase::Lobby || !self.players.contains(&player) {
-                    return Err(Error::new("join the lobby first"));
-                }
-                if req.ready {
-                    self.ready.insert(player);
-                } else {
-                    self.ready.remove(&player);
-                }
-                encode(&req.ready)
-            }
-            "start" => {
-                self.start(call.player()?)?;
-                self.arm_turn(ctx)?;
-                encode(&true)
-            }
-            "act" => {
-                let player = call.player()?;
-                let action: Action = call.decode()?;
-                let more = self.play(player, Some(&action))?;
-                self.arm_turn(ctx)?;
-                encode(&more)
-            }
-            "configure" => {
-                let allowed = match call.caller {
-                    Caller::Developer(_) => true,
-                    Caller::Player(p) => self.host == Some(p),
-                    _ => false,
-                };
-                if !allowed || self.phase != Phase::Lobby {
-                    return Err(Error::new("the host configures the session in the lobby"));
-                }
-                let config: Config = call.decode()?;
-                if config.min_players < 1 || config.max_players < config.min_players || config.max_players > 64 {
-                    return Err(Error::new("1 <= min_players <= max_players <= 64"));
-                }
-                if config.turn_ms < 1_000 {
-                    return Err(Error::new("turn_ms is at least 1000"));
-                }
-                self.config = config;
-                encode(&true)
-            }
-            "reserve" => {
-                if !matches!(call.caller, Caller::Instance(_) | Caller::Developer(_)) {
-                    return Err(Error::new("reserve is for the matchmaker"));
-                }
-                let req: Reserve = call.decode()?;
-                if self.phase != Phase::Lobby || !self.players.is_empty() {
-                    return Err(Error::new("the session is already in use"));
-                }
-                if req.players.is_empty() || req.players.len() > self.config.max_players {
-                    return Err(Error::new("reserve 1 to max_players players"));
-                }
-                self.reserved = req.players;
-                encode(&true)
-            }
-            other => return Err(Error::unknown_method(other)),
-        };
-        ctx.publish("session", &encode(&*self)?);
-        ctx.persist_now();
-        out
+        match call.method {
+            "state" => encode(&self.game),
+            kit::SNAPSHOT_METHOD => self.kit.snapshot_reply(ctx, TOPIC, &self.game),
+            _ => Receipts::run(self, |h| &mut h.receipts, &call, ctx.now_ms(), |h| h.act(ctx, &call)),
+        }
     }
 
     fn on_timer(&mut self, ctx: &Ctx, timer: &str) -> Result<()> {
+        let game = &mut self.game;
         match timer {
             "turn" => {
-                if let Some(player) = self.now_turn() {
-                    self.play(player, None)?;
-                    self.arm_turn(ctx)?;
+                if let Some(player) = game.now_turn() {
+                    game.play(player, None)?;
+                    game.arm_turn(ctx)?;
                 }
             }
-            "idle" if self.phase == Phase::Lobby && self.players.is_empty() => self.phase = Phase::Finished,
+            "idle" if game.phase == Phase::Lobby && game.players.is_empty() => game.phase = Phase::Finished,
             _ => return Ok(()),
         }
-        ctx.publish("session", &encode(&*self)?);
-        Ok(())
+        self.kit.snapshot(ctx, TOPIC, &self.game)
     }
 
-    fn on_session(&mut self, _ctx: &Ctx, player: u64, session: Session) -> Result<()> {
+    fn on_session(&mut self, ctx: &Ctx, player: u64, session: Session) -> Result<()> {
+        let game = &mut self.game;
         match session {
             Session::Joined => {
-                self.connected.insert(player);
+                game.connected.insert(player);
             }
             Session::Left => {
-                self.connected.remove(&player);
-                if self.host == Some(player)
-                    && let Some(next) = self.players.iter().find(|p| self.connected.contains(p))
+                game.connected.remove(&player);
+                if game.host == Some(player)
+                    && let Some(next) = game.players.iter().find(|p| game.connected.contains(p))
                 {
-                    self.host = Some(*next);
+                    game.host = Some(*next);
                 }
             }
         }
-        Ok(())
+        self.kit.snapshot(ctx, TOPIC, &self.game)
     }
 }
 
-ckx_sdk::export_hub!(GameSession);
+ckx_sdk::export_hub!(SessionHub);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ckx_sdk::kit::{Message, MessageKind, error_code};
+    use ckx_sdk::testing::TestHub;
 
     fn lobby(players: &[u64]) -> GameSession {
         let mut s = GameSession::default();
@@ -376,7 +419,9 @@ mod tests {
     #[test]
     fn a_reserved_session_admits_only_its_players() {
         let mut s = GameSession { reserved: vec![1, 2], ..Default::default() };
-        assert!(s.join(3).is_err());
+        let Error(why) = s.join(3).unwrap_err();
+        assert_eq!(error_code(&why).map(|c| c.0), Some(codes::RESERVED));
+        assert!(why.contains("reserved"));
         s.join(2).unwrap();
         assert_eq!(s.host, Some(2));
     }
@@ -391,5 +436,65 @@ mod tests {
         s.scores.insert(3, 5);
         assert!(!s.leave(2));
         assert_eq!((s.phase, s.winner), (Phase::Finished, Some(3)));
+    }
+
+    #[derive(Serialize)]
+    struct Act<'a> {
+        points: i64,
+        action_id: &'a str,
+    }
+
+    #[test]
+    fn every_change_is_a_snapshot_message_and_an_action_sent_again_runs_once() {
+        let mut hub = TestHub::<SessionHub>::spawn("session", "s1").unwrap();
+        for p in [1, 2] {
+            let _: bool = hub.call_typed(Caller::Player(p), "join", &()).unwrap();
+            let _: bool = hub.call_typed(Caller::Player(p), "ready", &Ready2 { ready: true }).unwrap();
+        }
+        let _: bool = hub.call_typed(Caller::Player(1), "start", &()).unwrap();
+        let more: bool = hub.call_typed(Caller::Player(1), "act", &Act { points: 3, action_id: "m1" }).unwrap();
+        assert!(more);
+        // The same action again (a lost reply): answered from the receipt, not played twice.
+        let again: bool = hub.call_typed(Caller::Player(1), "act", &Act { points: 3, action_id: "m1" }).unwrap();
+        assert!(again);
+        assert_eq!(hub.hub().game.scores[&1], 3);
+        assert_eq!(hub.hub().game.now_turn(), Some(2));
+
+        let published = hub.published();
+        assert!(published.iter().all(|(t, _)| t == TOPIC));
+        let seqs: Vec<u64> = published.iter().map(|(_, b)| decode::<Message<PhaseOnly>>(b).unwrap().header.seq).collect();
+        assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "one message a change, in order");
+        let last: Message<PhaseOnly> = decode(&published.last().unwrap().1).unwrap();
+        assert_eq!(last.header.kind, MessageKind::Snapshot);
+        assert_eq!(last.body.phase, Phase::Playing);
+
+        let snap: Message<PhaseOnly> = hub.call_typed(Caller::Player(2), "snapshot", &Topic { topic: TOPIC }).unwrap();
+        assert_eq!((snap.header.seq, snap.header.kind), (seqs.len() as u64, MessageKind::Snapshot));
+
+        let e = hub.call(Caller::Player(1), "act", &encode(&Act { points: 1, action_id: "m2" }).unwrap()).unwrap_err();
+        assert_eq!(error_code(&e.message).map(|c| c.0), Some(codes::NOT_YOUR_TURN));
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_kit_protocol_loads() {
+        let old = encode(&lobby(&[4, 5])).unwrap();
+        let hub = TestHub::<SessionHub>::load("session", "s1", &old, 1).unwrap();
+        assert_eq!(hub.hub().game.players, vec![4, 5]);
+        assert!(hub.hub().receipts.is_empty());
+    }
+
+    #[derive(Serialize)]
+    struct Ready2 {
+        ready: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct PhaseOnly {
+        phase: Phase,
+    }
+
+    #[derive(Serialize)]
+    struct Topic<'a> {
+        topic: &'a str,
     }
 }

@@ -1,21 +1,31 @@
-//! The mobs and NPCs of one area of the world, keyed `x,z` (the area's centre chunk), moved on a
-//! timer and shown to nearby players as server-driven actors. Mobs wander near home, chase the
-//! nearest player in range, go home past their leash, take players' hits and respawn; NPCs
-//! walk their routes and talk. Mobs see further at night and under an event's `aggro`
-//! modifier, from the root `world` hub's topic. Mobs and NPCs are typed containers
-//! ([`ckx_sdk::model`]), so players read only their public properties. Replaces the
-//! `mob-engine` and `npc-engine` templates.
+//! The mobs, NPCs and pets of one area of the world, keyed `x,z` (the area's centre chunk), moved
+//! on a timer and shown to nearby players as server-driven actors. Mobs wander near home, chase
+//! the nearest player in range, go home past their leash, take players' hits and respawn; NPCs
+//! walk their routes and talk; pets belong to a player and follow them while summoned. Mobs see
+//! further at night and under an event's `aggro` modifier, from the root `world` hub's topic.
+//! All of them are typed containers ([`ckx_sdk::model`]), so players read only their public
+//! properties (a pet's owner also reads its bond). Replaces the `mob-engine` and `npc-engine`
+//! templates.
 //!
-//! Endpoints: `state` (anyone), `attack { mob }` and `talk { npc }` (players). The type needs
-//! the `world.read` scope (where players are) and may call `world` (for its topic). Changes to
-//! public properties go out on the `area` topic once a second.
+//! Endpoints: `state` (anyone), `attack { mob }` and `talk { npc }` (players), and a player's
+//! pets: `adopt { species, name }`, `rename { pet, name }`, `summon { pet }`, `dismiss { pet }`,
+//! `release { pet }` and `pets` (the caller's, with their bond). The type needs the
+//! `world.read` scope (where players are) and may call `world` (for its topic).
+//!
+//! It speaks the kit protocol (`ckx_sdk::kit`): public property changes go out on the `area`
+//! topic as `delta`s once a second, `snapshot { topic: "area" }` answers every container's
+//! public view, changes may carry an `action_id`, and refusals carry `kit:<code>:` codes.
+//! Actors are shown with [`ActorState`] (`kit::wire`).
 
 use std::collections::BTreeMap;
 
+use ckx_sdk::kit::wire::{self, ActorState};
+use ckx_sdk::kit::{self, Publisher, Receipts, codes};
 use ckx_sdk::prelude::*;
 use serde_json::{Value, json};
 
 pub const TICK_MS: u64 = 250;
+pub const TOPIC: &str = "area";
 /// Ticks between scans of where players are, and between `area` pushes.
 const SCAN_EVERY: u64 = 4;
 const MOBS: u64 = 6;
@@ -24,6 +34,9 @@ const AGGRO: f64 = 2.5;
 const LEASH: f64 = 6.0;
 const MOB_SPEED: f64 = 0.5;
 const NPC_SPEED: f64 = 0.25;
+const PET_SPEED: f64 = 1.0;
+/// How close a following pet keeps to its owner.
+const PET_HEEL: f64 = 0.8;
 /// How near a player must be to hit a mob.
 const REACH: f64 = 1.5;
 /// The server decides a hit's damage, never the client.
@@ -32,6 +45,10 @@ const HIT_COOLDOWN_MS: u64 = 500;
 const RESPAWN_MS: u64 = 10_000;
 /// Players within this many chunks of a mob see it move.
 const SHOW_DISTANCE: u8 = 2;
+/// Pets one player may keep in an area, and the area may hold in all.
+pub const PETS_PER_PLAYER: usize = 3;
+const PETS_MAX: usize = 64;
+const NAME_MAX: usize = 24;
 
 pub fn schema() -> Schema {
     Schema::new()
@@ -54,16 +71,14 @@ pub fn schema() -> Schema {
                 .prop("route", PropKind::Json, json!([]), Visibility::Hidden)
                 .prop("leg", PropKind::Int, 0, Visibility::Hidden)
         })
-}
-
-/// What players near an actor receive as its state.
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub struct ActorState {
-    pub kind: String,
-    pub id: u64,
-    pub x: f64,
-    pub z: f64,
-    pub hp: Option<i64>,
+        .container("Pet", |c| {
+            c.prop("species", PropKind::Str, "cat", Visibility::Public)
+                .prop("name", PropKind::Str, "", Visibility::Public)
+                .prop("x", PropKind::Float, 0.0, Visibility::Public)
+                .prop("z", PropKind::Float, 0.0, Visibility::Public)
+                .prop("mode", PropKind::Str, "stay", Visibility::Public)
+                .prop("bond", PropKind::Int, 0, Visibility::Owner)
+        })
 }
 
 #[derive(Deserialize)]
@@ -83,6 +98,19 @@ struct Talk {
     npc: u64,
 }
 
+#[derive(Deserialize)]
+struct Adopt {
+    species: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PetRef {
+    pet: u64,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
@@ -94,6 +122,14 @@ fn toward(from: (f64, f64), to: (f64, f64), step: f64) -> (f64, f64) {
         return to;
     }
     (from.0 + (to.0 - from.0) * step / d, from.1 + (to.1 - from.1) * step / d)
+}
+
+fn short_text(what: &str, s: &str, max: usize) -> Result<String> {
+    let t = s.trim();
+    if t.is_empty() || t.chars().count() > max {
+        return Err(kit::error(codes::BAD_REQUEST, format!("a {what} is 1 to {max} characters")));
+    }
+    Ok(t.to_owned())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,7 +148,7 @@ pub struct Area {
 
 impl Area {
     pub fn new(key: &str) -> Result<Self> {
-        let center = key.split_once(',').and_then(|(x, z)| Some((x.trim().parse().ok()?, z.trim().parse().ok()?))).unwrap_or((0, 0));
+        let center = kit::shard::parse(key).unwrap_or((0, 0));
         let mut area = Self {
             schema: schema(),
             model: Model::new(),
@@ -228,20 +264,39 @@ impl Area {
         Ok(())
     }
 
+    /// Summoned pets walk to heel beside their owner, while the owner is in the area.
+    pub fn step_pets(&mut self, dt: f64) -> Result<()> {
+        let ids: Vec<u64> = self.model.of_type("Pet").collect();
+        for id in ids {
+            if self.model.get_str(&self.schema, id, "mode")? != "follow" {
+                continue;
+            }
+            let Some(owner) = self.model.container(id).and_then(|c| c.owner) else { continue };
+            let Some(&target) = self.players.get(&owner) else { continue };
+            let at = self.pos(id)?;
+            if dist(at, target) > PET_HEEL {
+                let d = dist(at, target);
+                let heel = (target.0 + (at.0 - target.0) * PET_HEEL / d, target.1 + (at.1 - target.1) * PET_HEEL / d);
+                self.place(id, toward(at, heel, PET_SPEED * dt))?;
+            }
+        }
+        Ok(())
+    }
+
     /// A player's hit on a mob: in reach at the last scan, not too fast, fixed damage.
     pub fn attack(&mut self, player: u64, mob: u64, now: u64) -> Result<i64> {
         if self.model.container(mob).is_none_or(|c| c.type_name != "Mob") {
-            return Err(Error::new(format!("no mob {mob}")));
+            return Err(kit::error(codes::NOT_FOUND, format!("no mob {mob}")));
         }
         if self.last_hit.get(&player).is_some_and(|at| now < at + HIT_COOLDOWN_MS) {
-            return Err(Error::new("attacking too fast"));
+            return Err(kit::error(codes::COOLDOWN, "attacking too fast"));
         }
-        let at = *self.players.get(&player).ok_or_else(|| Error::new("you are not in this area"))?;
+        let at = *self.players.get(&player).ok_or_else(|| kit::error("not_in_area", "you are not in this area"))?;
         if dist(at, self.pos(mob)?) > REACH {
-            return Err(Error::new("out of reach"));
+            return Err(kit::error(codes::OUT_OF_REACH, "out of reach"));
         }
         if self.model.get_i64(&self.schema, mob, "respawn_at")? > 0 {
-            return Err(Error::new("that mob is down"));
+            return Err(kit::error("down", "that mob is down"));
         }
         self.last_hit.insert(player, now);
         let hp = self.model.add(&self.schema, mob, "hp", -HIT)?;
@@ -253,8 +308,65 @@ impl Area {
         Ok(hp.max(0))
     }
 
+    /// A new pet for `player`, standing where they stand.
+    pub fn adopt(&mut self, player: u64, species: &str, name: &str) -> Result<u64> {
+        let at = *self.players.get(&player).ok_or_else(|| kit::error("not_in_area", "you are not in this area"))?;
+        let (species, name) = (short_text("species", species, NAME_MAX)?, short_text("name", name, NAME_MAX)?);
+        if self.pets_of(player).len() >= PETS_PER_PLAYER {
+            return Err(kit::error(codes::LIMIT, format!("at most {PETS_PER_PLAYER} pets a player in an area")));
+        }
+        if self.model.of_type("Pet").count() >= PETS_MAX {
+            return Err(kit::error(codes::FULL, "this area has as many pets as it holds"));
+        }
+        let id = self.model.create(&self.schema, "Pet", Some(player))?;
+        self.model.set(&self.schema, id, "species", species)?;
+        self.model.set(&self.schema, id, "name", name)?;
+        self.place(id, at)?;
+        Ok(id)
+    }
+
+    fn own_pet(&self, player: u64, pet: u64) -> Result<()> {
+        match self.model.container(pet) {
+            Some(c) if c.type_name == "Pet" && c.owner == Some(player) => Ok(()),
+            Some(c) if c.type_name == "Pet" => Err(kit::error(codes::FORBIDDEN, "that is someone else's pet")),
+            _ => Err(kit::error(codes::NOT_FOUND, format!("no pet {pet}"))),
+        }
+    }
+
+    /// The player's pets as their owner reads them, bond included.
+    pub fn pets_of(&self, player: u64) -> Vec<BTreeMap<String, Value>> {
+        self.model
+            .of_type("Pet")
+            .filter(|id| self.model.container(*id).is_some_and(|c| c.owner == Some(player)))
+            .filter_map(|id| {
+                let mut v = self.model.view(&self.schema, id, Viewer::Player(player)).ok()?;
+                v.insert("id".into(), json!(id));
+                Some(v)
+            })
+            .collect()
+    }
+
+    pub fn pet_command(&mut self, player: u64, method: &str, pet: u64, name: Option<String>) -> Result<()> {
+        self.own_pet(player, pet)?;
+        match method {
+            "rename" => {
+                let name = short_text("name", name.as_deref().unwrap_or(""), NAME_MAX)?;
+                self.model.set(&self.schema, pet, "name", name)?;
+            }
+            "summon" => {
+                self.set_mode(pet, "follow")?;
+                self.model.add(&self.schema, pet, "bond", 1)?;
+            }
+            "dismiss" => self.set_mode(pet, "stay")?,
+            _ => {
+                self.model.delete(pet);
+            }
+        }
+        Ok(())
+    }
+
     pub fn state(&self) -> Result<Vec<BTreeMap<String, Value>>> {
-        let ids = self.model.of_type("Mob").chain(self.model.of_type("Npc"));
+        let ids = self.model.of_type("Mob").chain(self.model.of_type("Npc")).chain(self.model.of_type("Pet"));
         ids.map(|id| {
             let mut v = self.model.view(&self.schema, id, Viewer::Public)?;
             v.insert("id".into(), json!(id));
@@ -274,39 +386,83 @@ impl Area {
         }
     }
 
-    fn show(&self, ctx: &Ctx) -> Result<()> {
-        for type_name in ["Mob", "Npc"] {
+    /// What players near each actor see of it.
+    pub fn actor_states(&self) -> Result<Vec<([u8; 32], ActorState)>> {
+        let mut out = Vec::new();
+        for type_name in ["Mob", "Npc", "Pet"] {
             for id in self.model.of_type(type_name) {
-                let hp = if type_name == "Mob" {
-                    if self.model.get_i64(&self.schema, id, "respawn_at")? > 0 {
-                        continue;
-                    }
-                    Some(self.model.get_i64(&self.schema, id, "hp")?)
-                } else {
-                    None
-                };
                 let (x, z) = self.pos(id)?;
+                let mut state = ActorState::new(&type_name.to_lowercase(), id, x, z);
+                match type_name {
+                    "Mob" => {
+                        if self.model.get_i64(&self.schema, id, "respawn_at")? > 0 {
+                            continue;
+                        }
+                        state.hp = Some(self.model.get_i64(&self.schema, id, "hp")?);
+                        state.max_hp = Some(self.model.get_i64(&self.schema, id, "max_hp")?);
+                        state.mode = Some(self.model.get_str(&self.schema, id, "mode")?);
+                    }
+                    "Pet" => {
+                        state.owner = self.model.container(id).and_then(|c| c.owner);
+                        state.name = Some(self.model.get_str(&self.schema, id, "name")?);
+                        state.mode = Some(self.model.get_str(&self.schema, id, "mode")?);
+                    }
+                    _ => state.name = Some(self.model.get_str(&self.schema, id, "name")?),
+                }
                 let actor = actor_id(&format!("{}{},{}:{id}", &type_name[..1], self.center.0, self.center.1));
-                let state = ActorState { kind: type_name.to_lowercase(), id, x, z, hp };
-                let _ = ctx.emit_actor(&actor, ChunkPos::new(x.floor() as i64, 0, z.floor() as i64), SHOW_DISTANCE, &encode(&state)?);
+                out.push((actor, state));
             }
         }
-        Ok(())
+        Ok(out)
     }
 }
 
-impl Hub for Area {
+/// The hub: the area, and what the kit protocol keeps beside it.
+#[derive(Serialize, Deserialize)]
+pub struct AreaHub {
+    #[serde(flatten)]
+    pub area: Area,
+    #[serde(default)]
+    pub kit: Publisher,
+    #[serde(default)]
+    pub receipts: Receipts,
+}
+
+impl AreaHub {
+    fn act(&mut self, call: &Call<'_>, now: u64) -> Result<Vec<u8>> {
+        let player = call.player()?;
+        match call.method {
+            "attack" => {
+                let req: Attack = kit::args(call)?;
+                encode(&self.area.attack(player, req.mob, now)?)
+            }
+            "adopt" => {
+                let req: Adopt = kit::args(call)?;
+                encode(&self.area.adopt(player, &req.species, &req.name)?)
+            }
+            "rename" | "summon" | "dismiss" | "release" => {
+                let req: PetRef = kit::args(call)?;
+                self.area.pet_command(player, call.method, req.pet, req.name)?;
+                encode(&true)
+            }
+            other => Err(Error::unknown_method(other)),
+        }
+    }
+}
+
+impl Hub for AreaHub {
     fn spawn(ctx: &Ctx, _seed: &[u8]) -> Result<Self> {
-        let area = Self::new(&ctx.key)?;
+        let area = Area::new(&ctx.key)?;
         ctx.timer_every("tick", TICK_MS)?;
         // The root hub's key is empty. Without a `world` type (or leave to call it) the area
         // runs without day and night.
         if let Err(e) = ctx.subscribe("world", "", "world") {
             ctx.log(Level::Info, &format!("not watching the world: {e}"));
         }
-        Ok(area)
+        Ok(Self { area, kit: Publisher::new(), receipts: Receipts::new() })
     }
 
+    /// Reads this version's snapshots and the earlier ones, which held the area alone.
     fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> {
         decode(snapshot)
     }
@@ -317,20 +473,18 @@ impl Hub for Area {
 
     fn handle(&mut self, ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
         match call.method {
-            "state" => encode(&self.state()?),
-            "attack" => {
-                let req: Attack = call.decode()?;
-                encode(&self.attack(call.player()?, req.mob, ctx.now_ms())?)
-            }
+            "state" => encode(&self.area.state()?),
+            kit::SNAPSHOT_METHOD => self.kit.model_snapshot_reply(ctx, &self.area.model, &self.area.schema, TOPIC),
             "talk" => {
                 call.player()?;
-                let req: Talk = call.decode()?;
-                if self.model.container(req.npc).is_none_or(|c| c.type_name != "Npc") {
-                    return Err(Error::new(format!("no npc {}", req.npc)));
+                let req: Talk = kit::args(&call)?;
+                if self.area.model.container(req.npc).is_none_or(|c| c.type_name != "Npc") {
+                    return Err(kit::error(codes::NOT_FOUND, format!("no npc {}", req.npc)));
                 }
-                encode(&self.model.view(&self.schema, req.npc, Viewer::Public)?)
+                encode(&self.area.model.view(&self.area.schema, req.npc, Viewer::Public)?)
             }
-            other => Err(Error::unknown_method(other)),
+            "pets" => encode(&self.area.pets_of(call.player()?)),
+            _ => Receipts::run(self, |h| &mut h.receipts, &call, ctx.now_ms(), |h| h.act(&call, ctx.now_ms())),
         }
     }
 
@@ -338,19 +492,23 @@ impl Hub for Area {
         if timer != "tick" {
             return Ok(());
         }
-        self.ticks += 1;
-        if self.ticks % SCAN_EVERY == 1 {
-            self.scan(ctx);
+        let area = &mut self.area;
+        area.ticks += 1;
+        if area.ticks % SCAN_EVERY == 1 {
+            area.scan(ctx);
         }
         let dt = TICK_MS as f64 / 1_000.0;
-        self.step_mobs(ctx.now_ms(), dt)?;
-        self.step_npcs(dt)?;
-        if !self.players.is_empty() {
-            self.show(ctx)?;
+        area.step_mobs(ctx.now_ms(), dt)?;
+        area.step_npcs(dt)?;
+        area.step_pets(dt)?;
+        if !area.players.is_empty() {
+            for (actor, state) in area.actor_states()? {
+                let _ = wire::emit_actor_state(ctx, &actor, SHOW_DISTANCE, &state);
+            }
         }
-        if self.ticks.is_multiple_of(SCAN_EVERY) {
-            self.last_hit.retain(|_, at| ctx.now_ms().saturating_sub(*at) < 60_000);
-            self.model.publish_changes(ctx, &self.schema, "area");
+        if area.ticks.is_multiple_of(SCAN_EVERY) {
+            area.last_hit.retain(|_, at| ctx.now_ms().saturating_sub(*at) < 60_000);
+            self.kit.model_changes(ctx, &mut self.area.model, &self.area.schema, TOPIC)?;
         }
         Ok(())
     }
@@ -358,18 +516,21 @@ impl Hub for Area {
     fn on_topic(&mut self, _ctx: &Ctx, msg: TopicMsg<'_>) -> Result<()> {
         if (msg.node_type, msg.topic) == ("world", "world") {
             let c: Conditions = msg.decode()?;
-            self.night = c.night;
-            self.aggro_scale = c.modifiers.get("aggro").copied().unwrap_or(1.0).clamp(0.1, 10.0);
+            self.area.night = c.night;
+            self.area.aggro_scale = c.modifiers.get("aggro").copied().unwrap_or(1.0).clamp(0.1, 10.0);
         }
         Ok(())
     }
 }
 
-ckx_sdk::export_hub!(Area);
+ckx_sdk::export_hub!(AreaHub);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ckx_sdk::kit::{Containers, Message, MessageKind, error_code};
+    use ckx_sdk::model::Published;
+    use ckx_sdk::testing::TestHub;
 
     fn area() -> Area {
         Area::new("10,-4").unwrap()
@@ -420,7 +581,8 @@ mod tests {
     fn hits_need_reach_respect_the_cooldown_and_a_downed_mob_respawns() {
         let mut a = area();
         let m = first_mob(&a);
-        assert!(a.attack(7, m, 0).is_err(), "not in the area");
+        let Error(why) = a.attack(7, m, 0).unwrap_err();
+        assert_eq!(error_code(&why).map(|c| c.0), Some("not_in_area"));
         let at = a.pos(m).unwrap();
         a.players.insert(7, (at.0 + REACH + 1.0, at.1));
         assert!(a.attack(7, m, 0).is_err(), "out of reach");
@@ -465,5 +627,53 @@ mod tests {
         let views = a.state().unwrap();
         assert!(views.iter().all(|v| !v.contains_key("route") && !v.contains_key("home_x") && !v.contains_key("respawn_at")));
         assert!(views.iter().any(|v| v.get("name") == Some(&json!("Warden"))));
+    }
+
+    #[test]
+    fn a_pet_is_its_owners_follows_them_when_summoned_and_keeps_its_bond_private() {
+        let mut a = area();
+        assert!(a.adopt(7, "cat", "Mog").is_err(), "not in the area");
+        a.players.insert(7, (10.5, -3.5));
+        let pet = a.adopt(7, "cat", "Mog").unwrap();
+        a.players.insert(8, (11.5, -3.5));
+        let Error(why) = a.pet_command(8, "summon", pet, None).unwrap_err();
+        assert_eq!(error_code(&why).map(|c| c.0), Some(codes::FORBIDDEN));
+        a.pet_command(7, "summon", pet, None).unwrap();
+        a.players.insert(7, (14.5, -3.5));
+        for _ in 0..10 {
+            a.step_pets(1.0).unwrap();
+        }
+        assert!(dist(a.pos(pet).unwrap(), (14.5, -3.5)) <= PET_HEEL + 0.01, "at heel");
+        assert_eq!(a.pets_of(7)[0].get("bond"), Some(&json!(1)), "the owner reads the bond");
+        let public = a.state().unwrap();
+        let shown = public.iter().find(|v| v.get("id") == Some(&json!(pet))).unwrap();
+        assert!(!shown.contains_key("bond"), "nobody else does");
+        for i in 0..PETS_PER_PLAYER - 1 {
+            a.adopt(7, "dog", &format!("Rex{i}")).unwrap();
+        }
+        let Error(why) = a.adopt(7, "dog", "One too many").unwrap_err();
+        assert_eq!(error_code(&why).map(|c| c.0), Some(codes::LIMIT));
+        a.pet_command(7, "release", pet, None).unwrap();
+        assert_eq!(a.pets_of(7).len(), PETS_PER_PLAYER - 1);
+    }
+
+    #[test]
+    fn changes_are_deltas_on_the_area_topic_and_the_snapshot_holds_every_container() {
+        let mut hub = TestHub::<AreaHub>::spawn("npcs", "0,0").unwrap();
+        hub.answer_node("world.actors_radius", |_| Ok(json!({ "actors": [] })));
+        hub.advance(TICK_MS * SCAN_EVERY).unwrap();
+        let deltas: Vec<Message<Published>> = hub.published().iter().filter(|(t, _)| t == TOPIC).map(|(_, b)| decode(b).unwrap()).collect();
+        assert_eq!(deltas.len(), 8, "every container's first view");
+        assert!(deltas.iter().all(|m| m.header.kind == MessageKind::Delta));
+        assert!(deltas.iter().all(|m| m.body.props.as_ref().is_some_and(|p| !p.contains_key("home_x"))));
+        let snap: Message<Containers> = hub.call_typed(Caller::Player(1), "snapshot", &json!({ "topic": TOPIC })).unwrap();
+        assert_eq!((snap.body.containers.len(), snap.header.seq), (8, 8));
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_kit_protocol_loads() {
+        let old = encode(&area()).unwrap();
+        let hub = TestHub::<AreaHub>::load("npcs", "10,-4", &old, 1).unwrap();
+        assert_eq!(hub.hub().area.model.of_type("Mob").count(), MOBS as usize);
     }
 }
