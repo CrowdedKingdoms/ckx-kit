@@ -7,12 +7,24 @@
 //! Endpoints: `state` (anyone), `harvest { node }` (players), and for the app's developers
 //! `schedule { name, start_ms, end_ms, modifiers }` and `cancel { name }`. The spawn seed, if
 //! any, is a JSON [`Config`].
+//!
+//! It speaks the kit protocol (`ckx_sdk::kit`). The `world` topic carries the [`Conditions`]
+//! as `snapshot` messages; the `nodes` topic carries each resource node's changes as `delta`s
+//! (`id`, `type_name` `Node`, `props` `amount` and `regrow_at`). `snapshot { topic }` answers
+//! either. Changes may carry an `action_id`; refusals carry `kit:<code>:` codes. It is the root
+//! hub, which takes 50 calls a second for the whole app: clients subscribe to its topics
+//! rather than polling `state`.
 
 use std::collections::BTreeMap;
 
+use ckx_sdk::kit::{self, Containers, Publisher, Receipts, codes};
+use ckx_sdk::model::Published;
 use ckx_sdk::prelude::*;
+use serde_json::json;
 
 pub const TICK_MS: u64 = 1_000;
+pub const WORLD_TOPIC: &str = "world";
+pub const NODES_TOPIC: &str = "nodes";
 /// The longest step the clock takes at once, so a world that was stopped resumes where it was.
 const MAX_STEP_MS: u64 = 5_000;
 const HARVEST_COOLDOWN_MS: u64 = 500;
@@ -131,8 +143,8 @@ impl World {
         x
     }
 
-    /// Advances the world to `now` (Unix milliseconds).
-    pub fn tick(&mut self, now: u64) {
+    /// Advances the world to `now` (Unix milliseconds), and returns the nodes that grew back.
+    pub fn tick(&mut self, now: u64) -> Vec<u32> {
         self.ticks += 1;
         self.clock_ms += now.saturating_sub(self.last_tick).min(MAX_STEP_MS);
         self.last_tick = now;
@@ -147,14 +159,17 @@ impl World {
             self.weather_until = self.clock_ms + hour * (2 + self.next_rand() % 5);
         }
         let amount = self.config.node_amount;
+        let mut regrown = Vec::new();
         for n in &mut self.nodes {
             if n.regrow_at.is_some_and(|at| now >= at) {
                 n.amount = amount;
                 n.regrow_at = None;
+                regrown.push(n.id);
             }
         }
         self.harvested.retain(|_, at| now.saturating_sub(*at) < 60_000);
         self.events.retain(|_, e| e.end_ms > now);
+        regrown
     }
 
     pub fn conditions(&self, now: u64) -> Conditions {
@@ -171,12 +186,13 @@ impl World {
 
     pub fn harvest(&mut self, player: u64, node: u32, now: u64) -> Result<u32> {
         if self.harvested.get(&player).is_some_and(|at| now < at + HARVEST_COOLDOWN_MS) {
-            return Err(Error::new("harvesting too fast"));
+            return Err(kit::error(codes::COOLDOWN, "harvesting too fast"));
         }
         let regrow_at = now + self.config.regrow_ms;
-        let n = self.nodes.iter_mut().find(|n| n.id == node).ok_or_else(|| Error::new(format!("no resource node {node}")))?;
+        let n =
+            self.nodes.iter_mut().find(|n| n.id == node).ok_or_else(|| kit::error(codes::NOT_FOUND, format!("no resource node {node}")))?;
         if n.amount == 0 {
-            return Err(Error::new("that node is empty; it grows back"));
+            return Err(kit::error(codes::EMPTY, "that node is empty; it grows back"));
         }
         n.amount -= 1;
         if n.amount == 0 {
@@ -188,19 +204,30 @@ impl World {
 
     pub fn schedule(&mut self, event: Event, now: u64) -> Result<()> {
         if event.name.is_empty() || event.name.len() > 64 {
-            return Err(Error::new("an event name is 1-64 characters"));
+            return Err(kit::error(codes::BAD_REQUEST, "an event name is 1-64 characters"));
         }
         if event.end_ms <= event.start_ms || event.end_ms <= now {
-            return Err(Error::new("an event ends after it starts, and in the future"));
+            return Err(kit::error(codes::BAD_REQUEST, "an event ends after it starts, and in the future"));
         }
         if event.modifiers.len() > MAX_MODIFIERS || event.modifiers.values().any(|v| !v.is_finite() || *v <= 0.0 || *v > 100.0) {
-            return Err(Error::new(format!("at most {MAX_MODIFIERS} modifiers, each above 0 and at most 100")));
+            return Err(kit::error(codes::BAD_REQUEST, format!("at most {MAX_MODIFIERS} modifiers, each above 0 and at most 100")));
         }
         if !self.events.contains_key(&event.name) && self.events.len() >= MAX_EVENTS {
-            return Err(Error::new(format!("at most {MAX_EVENTS} events are scheduled at once")));
+            return Err(kit::error(codes::LIMIT, format!("at most {MAX_EVENTS} events are scheduled at once")));
         }
         self.events.insert(event.name.clone(), event);
         Ok(())
+    }
+
+    /// A resource node as the `nodes` topic shows it.
+    pub fn node_delta(&self, id: u32) -> Option<Published> {
+        let n = self.nodes.iter().find(|n| n.id == id)?;
+        let props = BTreeMap::from([("amount".to_owned(), json!(n.amount)), ("regrow_at".to_owned(), json!(n.regrow_at))]);
+        Some(Published { id: u64::from(n.id), type_name: Some("Node".to_owned()), props: Some(props), removed: false })
+    }
+
+    pub fn node_collection(&self) -> Containers {
+        Containers { containers: self.nodes.iter().filter_map(|n| self.node_delta(n.id)).collect() }
     }
 
     pub fn view(&self, now: u64) -> View {
@@ -214,7 +241,66 @@ impl World {
     }
 }
 
-impl Hub for World {
+/// The hub: the world, and what the kit protocol keeps beside it.
+#[derive(Serialize, Deserialize, Default)]
+pub struct WorldHub {
+    #[serde(flatten)]
+    pub world: World,
+    #[serde(default)]
+    pub kit: Publisher,
+    #[serde(default)]
+    pub receipts: Receipts,
+}
+
+fn developer(call: &Call<'_>) -> Result<u64> {
+    call.developer().map_err(|_| kit::error(codes::FORBIDDEN, format!("`{}` is for the app's developers", call.method)))
+}
+
+impl WorldHub {
+    fn act(&mut self, ctx: &Ctx, call: &Call<'_>, now: u64) -> Result<Vec<u8>> {
+        match call.method {
+            "harvest" => {
+                let player = call.player()?;
+                let req: Harvest = kit::args(call)?;
+                let left = self.world.harvest(player, req.node, now)?;
+                if let Some(d) = self.world.node_delta(req.node) {
+                    self.kit.delta(ctx, NODES_TOPIC, &d)?;
+                }
+                encode(&left)
+            }
+            "schedule" => {
+                developer(call)?;
+                self.world.schedule(kit::args(call)?, now)?;
+                ctx.persist_now();
+                self.publish_conditions(ctx, now, true)?;
+                encode(&true)
+            }
+            "cancel" => {
+                developer(call)?;
+                let req: Cancel = kit::args(call)?;
+                let removed = self.world.events.remove(&req.name).is_some();
+                self.publish_conditions(ctx, now, true)?;
+                encode(&removed)
+            }
+            other => Err(Error::unknown_method(other)),
+        }
+    }
+
+    /// Publishes the conditions when they changed in a way players notice, or `always`, and
+    /// every [`PUBLISH_EVERY`] ticks regardless so clients keep the clock.
+    fn publish_conditions(&mut self, ctx: &Ctx, now: u64, always: bool) -> Result<()> {
+        let c = self.world.conditions(now);
+        let notable =
+            self.world.published.as_ref().is_none_or(|p| p.night != c.night || p.weather != c.weather || p.modifiers != c.modifiers);
+        if always || notable || self.world.ticks.is_multiple_of(PUBLISH_EVERY) {
+            self.kit.snapshot(ctx, WORLD_TOPIC, &c)?;
+            self.world.published = Some(c);
+        }
+        Ok(())
+    }
+}
+
+impl Hub for WorldHub {
     fn spawn(ctx: &Ctx, seed: &[u8]) -> Result<Self> {
         let config = if seed.is_empty() {
             Config::default()
@@ -222,9 +308,10 @@ impl Hub for World {
             serde_json::from_slice(seed).map_err(|e| Error::new(format!("seed is not a JSON config: {e}")))?
         };
         ctx.timer_every("tick", TICK_MS)?;
-        Ok(Self::new(config, ctx.now_ms()))
+        Ok(Self { world: World::new(config, ctx.now_ms()), ..Default::default() })
     }
 
+    /// Reads this version's snapshots and the earlier ones, which held the world alone.
     fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> {
         decode(snapshot)
     }
@@ -236,24 +323,13 @@ impl Hub for World {
     fn handle(&mut self, ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
         let now = ctx.now_ms();
         match call.method {
-            "state" => encode(&self.view(now)),
-            "harvest" => {
-                let player = call.player()?;
-                let req: Harvest = call.decode()?;
-                encode(&self.harvest(player, req.node, now)?)
-            }
-            "schedule" => {
-                call.developer()?;
-                self.schedule(call.decode()?, now)?;
-                ctx.persist_now();
-                encode(&true)
-            }
-            "cancel" => {
-                call.developer()?;
-                let req: Cancel = call.decode()?;
-                encode(&self.events.remove(&req.name).is_some())
-            }
-            other => Err(Error::unknown_method(other)),
+            "state" => encode(&self.world.view(now)),
+            kit::SNAPSHOT_METHOD => match kit::snapshot_topic(&call, WORLD_TOPIC).as_str() {
+                WORLD_TOPIC => self.kit.snapshot_reply(ctx, WORLD_TOPIC, &self.world.conditions(now)),
+                NODES_TOPIC => self.kit.snapshot_reply(ctx, NODES_TOPIC, &self.world.node_collection()),
+                other => Err(kit::error(codes::NOT_FOUND, format!("no topic `{other}`"))),
+            },
+            _ => Receipts::run(self, |h| &mut h.receipts, &call, now, |h| h.act(ctx, &call, now)),
         }
     }
 
@@ -262,23 +338,21 @@ impl Hub for World {
             return Ok(());
         }
         let now = ctx.now_ms();
-        self.tick(now);
-        let c = self.conditions(now);
-        let notable = self.published.as_ref().is_none_or(|p| p.night != c.night || p.weather != c.weather || p.modifiers != c.modifiers);
-        if notable || self.ticks.is_multiple_of(PUBLISH_EVERY) {
-            ctx.publish("world", &encode(&c)?);
-            self.published = Some(c);
+        for id in self.world.tick(now) {
+            if let Some(d) = self.world.node_delta(id) {
+                self.kit.delta(ctx, NODES_TOPIC, &d)?;
+            }
         }
-        Ok(())
+        self.publish_conditions(ctx, now, false)
     }
 
     fn on_presence(&mut self, _ctx: &Ctx, presence: &Presence) -> Result<()> {
-        self.online = presence.count;
+        self.world.online = presence.count;
         Ok(())
     }
 }
 
-ckx_sdk::export_hub!(World);
+ckx_sdk::export_hub!(WorldHub);
 
 #[cfg(test)]
 mod tests {
@@ -342,5 +416,44 @@ mod tests {
     fn a_seed_is_a_json_config_with_defaults() {
         let c: Config = serde_json::from_slice(br#"{"nodes": 3}"#).unwrap();
         assert_eq!((c.nodes, c.node_amount), (3, Config::default().node_amount));
+    }
+
+    #[derive(Serialize)]
+    struct H<'a> {
+        node: u32,
+        action_id: &'a str,
+    }
+
+    #[test]
+    fn harvests_and_regrowth_are_deltas_on_the_nodes_topic_and_a_resent_harvest_takes_once() {
+        use ckx_sdk::kit::{Message, MessageKind};
+        use ckx_sdk::testing::TestHub;
+        let seed = br#"{"nodes": 2, "node_amount": 1, "regrow_ms": 1000}"#;
+        let mut hub = TestHub::<WorldHub>::spawn_with("world", "", seed).unwrap();
+        let left: u32 = hub.call_typed(Caller::Player(1), "harvest", &H { node: 0, action_id: "h1" }).unwrap();
+        let again: u32 = hub.call_typed(Caller::Player(1), "harvest", &H { node: 0, action_id: "h1" }).unwrap();
+        assert_eq!((left, again), (0, 0));
+        let e = hub.call(Caller::Player(1), "harvest", &encode(&H { node: 0, action_id: "h2" }).unwrap()).unwrap_err();
+        assert_eq!(kit::error_code(&e.message).map(|c| c.0), Some(codes::COOLDOWN));
+        hub.advance(1_500).unwrap();
+        let deltas: Vec<Message<Published>> =
+            hub.published().iter().filter(|(t, _)| t == NODES_TOPIC).map(|(_, b)| decode(b).unwrap()).collect();
+        assert_eq!(deltas.len(), 2, "emptied, then grown back");
+        assert!(deltas.iter().all(|m| m.header.kind == MessageKind::Delta && m.body.id == 0));
+        assert_eq!(deltas[1].body.props.as_ref().unwrap()["amount"], json!(1));
+        let conditions: Vec<Message<Conditions>> =
+            hub.published().iter().filter(|(t, _)| t == WORLD_TOPIC).map(|(_, b)| decode(b).unwrap()).collect();
+        assert!(!conditions.is_empty(), "the first tick publishes the conditions");
+        let nodes: Message<Containers> = hub.call_typed(Caller::Player(2), "snapshot", &json!({ "topic": NODES_TOPIC })).unwrap();
+        assert_eq!((nodes.body.containers.len(), nodes.header.seq), (2, 2));
+        assert!(hub.call(Caller::Player(1), "schedule", &[]).is_err(), "developers only");
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_kit_protocol_loads() {
+        use ckx_sdk::testing::TestHub;
+        let old = encode(&world()).unwrap();
+        let hub = TestHub::<WorldHub>::load("world", "", &old, 1).unwrap();
+        assert_eq!(hub.hub().world.nodes.len(), 2);
     }
 }
