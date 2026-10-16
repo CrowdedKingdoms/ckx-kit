@@ -47,7 +47,8 @@
 //!
 //! [`kit`] is the game kit's half here: the protocol kit hubs speak to the kit clients
 //! (snapshots and deltas with sequence numbers, retry-safe actions, refusal codes), shard keys,
-//! a seeded random generator, and the realtime event registry.
+//! a seeded random generator, the realtime event registry, and the pieces games are made of
+//! (`kit::play`, `kit::sim`, `kit::ai`, and the soft economy in `kit::econ`).
 
 mod abi;
 pub mod cron;

@@ -37,7 +37,7 @@ on the platform: Crowdy Studio, or `execModBuild` then `execModDeploy` (see
 
 | Command | What it does |
 |---|---|
-| `ckx-kit new <template> <name>` | A crate to start from: `mod`, `client` (a mod's CLIENT half), `hub`, `spoke`, or a starter pack crate (`world-tick`, `matchmaker`, `session`, `npc-mobs`, `leaderboard`, `deck`, `tactics`, `director`, `minigame`, `instance`, `arena`, `racing`, `territory`). |
+| `ckx-kit new <template> <name>` | A crate to start from: `mod`, `client` (a mod's CLIENT half), `hub`, `spoke`, or a starter pack crate (`world-tick`, `matchmaker`, `session`, `npc-mobs`, `leaderboard`, `deck`, `tactics`, `director`, `minigame`, `instance`, `arena`, `racing`, `territory`, `player`, `market`). |
 | `ckx-kit check [dir]` | The platform's source checks, on exactly the files it takes (`Cargo.toml`, `README.md`, `.rs` files under `src/`). Lists what it would not send. |
 | `ckx-kit build [dir]` | The checks, then the pinned Rust for `wasm32-unknown-unknown` with the platform's release profile and the platform's dependency versions, then the module check. `--mod` adds the mod limits. A CLIENT half is metered and optimized as the platform does it, and its capability summary, the list visitors are asked to agree to, is printed with its hash. `--json` prints a report. |
 | `ckx-kit doctor` | What a build here needs, and which platform toolchain this kit matches. |
@@ -55,7 +55,11 @@ random generator and the realtime event registry. The starter pack crates speak 
 clients' typed modules drive them as they are. From `ckx-sdk` 0.11.0 it also has the pieces the
 genre starters are made of: `kit::play` (turns, scores, cards, combat, abilities, timing, a
 movement warden for positions clients report), `kit::sim` (day cycle, weather, resource nodes,
-waves, zones) and `kit::ai` (paths, flow fields, steering, behavior trees).
+waves, zones) and `kit::ai` (paths, flow fields, steering, behavior trees); from 0.12.0
+`kit::econ`, the soft economy the `player` and `market` starters keep in hub state: items,
+wallets, holds, references answered once, recipes, loot with pity, production, vendors, an
+order book, levels, achievements and quests. It is not a ledger: no real money, and a transfer
+between hubs is steps, not a transaction.
 
 ## Test
 
