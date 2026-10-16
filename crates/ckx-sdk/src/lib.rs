@@ -44,10 +44,16 @@
 //! Nodes are unit tested natively with `cargo test`: `testing` runs one against a fake of the
 //! platform (calls, timers, events, snapshots, the node API, a mod's grid). [`limits`] has the
 //! platform's bounds.
+//!
+//! [`kit`] is the game kit's half here: the protocol kit hubs speak to the kit clients
+//! (snapshots and deltas with sequence numbers, retry-safe actions, refusal codes), shard keys,
+//! a seeded random generator, the realtime event registry, and the pieces games are made of
+//! (`kit::play`, `kit::sim`, `kit::ai`, and the soft economy in `kit::econ`).
 
 mod abi;
 pub mod cron;
 pub mod emit;
+pub mod kit;
 pub mod limits;
 pub mod model;
 pub mod node;
@@ -546,20 +552,25 @@ macro_rules! export_spoke {
     };
 }
 
+// Only the module the sandbox loads needs the exports: a native build (a unit test, a crate
+// that includes several nodes' sources) defines none, so nodes link side by side.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __export_node {
     ($node:ty) => {
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_abi() -> u32 {
             $crate::rt::ABI_VERSION
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_alloc(len: u32) -> u32 {
             $crate::rt::alloc(len)
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_init(
             ctx_ptr: u32,
@@ -574,16 +585,19 @@ macro_rules! __export_node {
             $crate::rt::init::<$node>(ctx_ptr, ctx_len, seed_ptr, seed_len, snap_ptr, snap_len, snap_version, has_snap)
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_handle(caller_kind: u32, caller_id: u64, buf_ptr: u32, method_len: u32, payload_len: u32) -> u64 {
             $crate::rt::handle(caller_kind, caller_id, buf_ptr, method_len, payload_len)
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_persist() -> u64 {
             $crate::rt::persist()
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn ckx_evict() {
             $crate::rt::evict()
