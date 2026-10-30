@@ -6,6 +6,7 @@ import {
   validateExecCrates,
   validateExecManifest,
   validateExecPath,
+  execArtifactName,
 } from './exec-source';
 
 const CARGO = `[package]
@@ -165,6 +166,30 @@ describe('rewriteExecManifest', () => {
     expect(out).not.toContain('../../crates/ckx-sdk');
     expect(out).toContain('[profile.release]');
     expect(out).toContain('panic = "abort"');
+  });
+});
+
+describe('execArtifactName', () => {
+  it('names the module cargo writes: [lib] name, else the package name, - as _', () => {
+    expect(execArtifactName(CARGO)).toBe(
+      `${/name = "([^"]+)"/.exec(CARGO)![1].replace(/-/g, '_')}.wasm`,
+    );
+    expect(
+      execArtifactName(
+        '[package]\nname = "world-tick" # a comment\nversion = "0.1.0"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      ),
+    ).toBe('world_tick.wasm');
+    expect(
+      execArtifactName(
+        '[package]\nname = "npc-mobs"\n\n[lib]\nname = "mobs-core"\ncrate-type = ["cdylib"]\n',
+      ),
+    ).toBe('mobs_core.wasm');
+    expect(() => execArtifactName('[lib]\ncrate-type = ["cdylib"]\n')).toThrow(
+      /no \[package\] name/,
+    );
+    expect(() =>
+      execArtifactName('[package]\nname = "../../escape"\n'),
+    ).toThrow(/is not a crate name/);
   });
 });
 

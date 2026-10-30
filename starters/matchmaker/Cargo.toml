@@ -9,5 +9,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-ckx-sdk = "0.12.1"
+ckx-sdk = "0.13.0"
 serde = { version = "1", features = ["derive"] }

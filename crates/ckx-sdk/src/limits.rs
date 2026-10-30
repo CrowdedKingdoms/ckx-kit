@@ -19,6 +19,9 @@ pub const MAX_LOG_BYTES: usize = 4 << 10;
 pub const MAX_EMIT_BYTES: usize = 70 + crate::emit::MAX_PAYLOAD;
 /// The largest snapshot a hub may persist. A larger one fails to save, and the last one stands.
 pub const MAX_SNAPSHOT_BYTES: usize = 8 << 20;
+/// The most JSON a hub's [`crate::Hub::on_player_export`] may answer. A larger answer is an
+/// error, and the export records the hub as failed.
+pub const MAX_EXPORT_BYTES: usize = 1 << 20;
 /// The largest module an app's node type may deploy.
 pub const ARTIFACT_MAX_BYTES: usize = 16 << 20;
 
