@@ -298,10 +298,25 @@ impl<T: Hub> HubNode<T> {
                 };
                 self.0.on_session(ctx, p, session)?
             }
+            (ERASE, Caller::Platform) => self.0.on_player_erased(ctx, decode::<PlayerEvent>(call.payload)?.player)?,
+            (EXPORT, Caller::Platform) => {
+                let held = self.0.on_player_export(ctx, decode::<PlayerEvent>(call.payload)?.player)?;
+                let json = serde_json::to_vec(&held).map_err(|e| Error(format!("export: {e}")))?;
+                if json.len() > crate::limits::MAX_EXPORT_BYTES {
+                    return Err(Error(format!("the export of {} bytes exceeds {}", json.len(), crate::limits::MAX_EXPORT_BYTES)));
+                }
+                return Ok(json);
+            }
             (m, c) => return Err(Error(format!("no platform event `{m}` from {c:?}"))),
         }
         Ok(Vec::new())
     }
+}
+
+/// The payload of `$erase` and `$export`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PlayerEvent {
+    pub player: u64,
 }
 
 /// The platform's reserved method names: its events.
@@ -313,6 +328,8 @@ pub(crate) mod ckx_platform {
     pub const SESSION: &str = "$session";
     pub const SESSION_JOINED: u8 = 1;
     pub const SESSION_LEFT: u8 = 0;
+    pub const ERASE: &str = "$erase";
+    pub const EXPORT: &str = "$export";
 }
 
 impl<T: Hub> Node for HubNode<T> {
