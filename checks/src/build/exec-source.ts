@@ -281,6 +281,36 @@ export function validateExecCrates(
 }
 
 /**
+ * The file name cargo gives a validated crate's module: its `[lib] name`, else its package
+ * name with `-` as `_`, then `.wasm`. A build's crates share one target directory, so the
+ * module has to be found by name rather than as the only `.wasm` there.
+ */
+export function execArtifactName(manifest: string): string {
+  let section = '';
+  let pkg: string | null = null;
+  let lib: string | null = null;
+  for (const raw of manifest.split(/\r?\n/)) {
+    const line = stripComment(raw).trim();
+    const header = line.match(/^\[([^\]]+)\]$/);
+    if (header) {
+      section = header[1].trim();
+      continue;
+    }
+    const kv = line.match(/^name\s*=\s*"([^"]+)"$/);
+    if (!kv) continue;
+    if (section === 'package') pkg = kv[1];
+    if (section === 'lib') lib = kv[1];
+  }
+  const name = lib ?? pkg;
+  if (!name) fail('Cargo.toml has no [package] name');
+  // The name becomes a file name under the build's target directory: a cargo identifier and
+  // nothing a path could be made of, before cargo itself would refuse it.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name))
+    fail(`Cargo.toml name '${name}' is not a crate name`);
+  return `${name.replace(/-/g, '_')}.wasm`;
+}
+
+/**
  * Points the kind's SDK at the toolchain's pinned copy and appends the platform release
  * profile (a crate may not declare its own; the validator refuses [profile]).
  */
