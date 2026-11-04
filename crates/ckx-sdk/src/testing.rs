@@ -2,8 +2,8 @@
 //!
 //! [`TestHub`] and [`TestSpoke`] run a node on the test's thread the way a sandbox runs it:
 //! calls from players, developers and other instances; a hub's platform events (timers on a
-//! clock the test moves, topics it watches, presence, sessions, and a mod's world events); and
-//! a snapshot and a start from it. The platform's side is a [`FakePlatform`]. It keeps what the
+//! clock the test moves, topics it watches, presence, sessions, a mod's world events, and a
+//! player's erasure and export); and a snapshot and a start from it. The platform's side is a [`FakePlatform`]. It keeps what the
 //! node logged, published, sent and emitted; holds each call to the sandbox's bounds
 //! ([`crate::limits`]); answers calls to other types and node API operations with what the test
 //! scripts; and serves a mod its [`FakeGrid`] under the node API's rules for mods.
@@ -70,7 +70,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::abi::native::{self, Host};
-use crate::node::{Actor, Chunk, ChunkPos, Voxel};
+use crate::node::{Actor, Chunk, ChunkPos, Voxel, rfc3339};
 use crate::rt::{HubNode, Node, SpokeNode, ckx_platform as platform};
 use crate::{Call, CallError, Caller, Ctx, Error, Hub, Kind, Level, Presence, Session, Spoke, Status, WorldEvent, decode, encode, limits};
 
@@ -431,7 +431,7 @@ impl FakePlatform {
         }
         match caller {
             Caller::Platform => {
-                Err(bad_request("the platform calls a node only with its events: advance, topic, presence, session, world"))
+                Err(bad_request("the platform calls a node only with its events: advance, topic, presence, session, world, erase, export"))
             }
             Caller::Instance(_) if self.state.borrow().is_mod() => Err(denied("only players call mods")),
             _ => Ok(()),
@@ -696,6 +696,26 @@ impl<T: Hub> TestHub<T> {
         self.event(Caller::Platform, platform::PRESENCE, &payload)
     }
 
+    /// `player`'s account being erased, as the platform tells every hub: `$erase`, then a
+    /// snapshot, which the platform stores before it counts the hub done. A hub without the hook
+    /// answers `AppError` "not implemented: …".
+    pub fn erase(&mut self, player: u64) -> Result<(), CallError> {
+        let payload = player_payload(player).map_err(|Error(m)| bad_request(m))?;
+        self.event(Caller::Platform, platform::ERASE, &payload)?;
+        self.persist().map(|_| ())
+    }
+
+    /// What the hub holds about `player`, as the platform asks it for their data export:
+    /// `Value::Null` when it holds nothing. A hub without the hook answers `AppError` "not
+    /// implemented: …".
+    pub fn export(&mut self, player: u64) -> Result<Value, CallError> {
+        let payload = player_payload(player).map_err(|Error(m)| bad_request(m))?;
+        let node = self.node.as_mut().expect("the hub runs");
+        let json = self.platform.handle(node, Caller::Platform, platform::EXPORT, &payload)?;
+        serde_json::from_slice(&json)
+            .map_err(|e| CallError { status: Status::Internal, message: format!("an export that is not JSON: {e}") })
+    }
+
     /// `node_type`/`key` publishing `payload` on `topic`. A hub hears only the topics it
     /// watches.
     pub fn topic(&mut self, node_type: &str, key: &str, topic: &str, payload: &[u8]) -> Result<(), CallError> {
@@ -818,6 +838,12 @@ pub fn world_payload(events: &[WorldEvent]) -> crate::Result<Vec<u8>> {
     encode(&Batch { events })
 }
 
+/// The payload of the `$erase` and `$export` calls the platform makes about `player`: what
+/// [`TestHub::erase`] and [`TestHub::export`] hand a hub.
+pub fn player_payload(player: u64) -> crate::Result<Vec<u8>> {
+    encode(&crate::rt::PlayerEvent { player })
+}
+
 // ---- the node API, as it serves a mod ----
 
 /// The node API operations a mod may call.
@@ -825,12 +851,13 @@ const MOD_OPS: [&str; 7] =
     ["world.chunk", "world.voxels", "world.actors", "world.actors_radius", "world.set_voxels", "grids.get", "grids.check_permission"];
 
 /// Each node API operation and the scope it needs.
-const OP_SCOPES: [(&str, &str); 27] = [
+const OP_SCOPES: [(&str, &str); 29] = [
     ("players.get", "players.read"),
     ("players.features", "players.read"),
     ("players.check_permission", "players.read"),
     ("players.state", "players.read"),
     ("players.avatar_state", "players.read"),
+    ("players.blocked", "players.read"),
     ("players.set_state", "players.write"),
     ("world.chunk", "world.read"),
     ("world.voxels", "world.read"),
@@ -853,6 +880,7 @@ const OP_SCOPES: [(&str, &str); 27] = [
     ("access.revoke", "access.write"),
     ("access.suspend", "access.write"),
     ("access.unsuspend", "access.write"),
+    ("safety.report", "safety.write"),
 ];
 
 /// Rows the node API returns at most: actors in one chunk, in a radius, voxels in a chunk.
@@ -952,21 +980,6 @@ fn pos_json(p: ChunkPos) -> Value {
 
 fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
-}
-
-/// Unix milliseconds as the game API writes a time: `2026-01-01T00:00:00.000Z`.
-fn rfc3339(ms: u64) -> String {
-    let (secs, millis) = (ms / 1000, ms % 1000);
-    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
-    let z = days + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 type Pos = (i64, i64, i64);
@@ -1424,6 +1437,85 @@ mod tests {
         assert_eq!(hub.call(Caller::Player(1), "nope", &[]).unwrap_err().status, Status::AppError);
     }
 
+    /// Scores by player: what the platform's erasure and export reach.
+    #[derive(Default, Serialize, Deserialize)]
+    struct Keeper {
+        scores: std::collections::BTreeMap<u64, i64>,
+    }
+
+    impl Hub for Keeper {
+        fn spawn(_ctx: &Ctx, _seed: &[u8]) -> Result<Self> {
+            Ok(Self::default())
+        }
+
+        fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> {
+            decode(snapshot)
+        }
+
+        fn persist(&mut self, _ctx: &Ctx) -> Result<Vec<u8>> {
+            encode(self)
+        }
+
+        fn handle(&mut self, _ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
+            match call.method {
+                "score" => {
+                    *self.scores.entry(call.player()?).or_default() += call.decode::<i64>()?;
+                    Ok(Vec::new())
+                }
+                "flood" => {
+                    self.scores.extend((0..60_000).map(|p| (p, i64::MAX)));
+                    Ok(Vec::new())
+                }
+                other => Err(Error::unknown_method(other)),
+            }
+        }
+
+        fn on_player_erased(&mut self, _ctx: &Ctx, player: u64) -> Result<()> {
+            self.scores.remove(&player);
+            Ok(())
+        }
+
+        fn on_player_export(&mut self, _ctx: &Ctx, player: u64) -> Result<Value> {
+            if player == 7 {
+                return Ok(json!({ "everyone": self.scores }));
+            }
+            Ok(self.scores.get(&player).map_or(Value::Null, |s| json!({ "score": s })))
+        }
+    }
+
+    #[test]
+    fn a_hub_erases_and_exports_a_player_as_the_platform_asks() {
+        let mut hub = TestHub::<Keeper>::spawn("board", "a").unwrap();
+        hub.call(Caller::Player(42), "score", &encode(&5).unwrap()).unwrap();
+        hub.call(Caller::Player(43), "score", &encode(&9).unwrap()).unwrap();
+        assert_eq!(hub.export(42).unwrap(), json!({ "score": 5 }));
+        assert_eq!(hub.export(44).unwrap(), Value::Null, "nothing held");
+        hub.erase(42).unwrap();
+        assert_eq!(hub.export(42).unwrap(), Value::Null);
+        hub.restart().unwrap();
+        assert_eq!(hub.hub().scores.keys().copied().collect::<Vec<_>>(), vec![43], "the erasure is in the snapshot");
+        for method in ["$erase", "$export"] {
+            for caller in [Caller::Player(42), Caller::Developer(1), Caller::Instance(9)] {
+                let e = hub.call(caller, method, &player_payload(43).unwrap()).unwrap_err();
+                assert_eq!(e.status, Status::Denied, "{method} from {caller:?}");
+            }
+        }
+        assert_eq!(hub.hub().scores.len(), 1);
+
+        hub.call(Caller::Player(1), "flood", &[]).unwrap();
+        let e = hub.export(7).unwrap_err();
+        assert!(e.status == Status::AppError && e.message.contains("exceeds"), "{e}");
+    }
+
+    #[test]
+    fn a_hub_without_the_hooks_answers_not_implemented() {
+        let mut hub = TestHub::<Ticker>::spawn("ticker", "a").unwrap();
+        for e in [hub.erase(42).unwrap_err(), hub.export(42).unwrap_err()] {
+            assert_eq!(e.status, Status::AppError);
+            assert!(e.message.starts_with("not implemented: `on_player_e"), "{e}");
+        }
+    }
+
     #[test]
     fn one_node_runs_on_a_thread_at_a_time() {
         let hub = TestHub::<Ticker>::spawn("ticker", "a").unwrap();
@@ -1431,12 +1523,5 @@ mod tests {
         assert!(second.is_err());
         drop(hub);
         TestHub::<Ticker>::spawn("ticker", "b").unwrap();
-    }
-
-    #[test]
-    fn writes_times_as_the_game_api_does() {
-        assert_eq!(rfc3339(START_MS), "2026-01-01T00:00:00.000Z");
-        assert_eq!(rfc3339(951_782_400_123), "2000-02-29T00:00:00.123Z");
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
     }
 }

@@ -31,15 +31,18 @@
 //! Realtime events players around see at once go through [`Ctx::emit_spatial`],
 //! [`Ctx::emit_actor`] and [`Ctx::emit_channel`]; see [`emit`].
 //!
-//! Platform data (world, grids, players, grid permissions, players' access to the app) is behind
-//! [`Ctx::world`], [`Ctx::grids`], [`Ctx::players`], [`Ctx::permissions`] and [`Ctx::access`],
-//! each needing a scope the node type declares in the manifest; see [`node`].
+//! Platform data (world, grids, players, grid permissions, players' access to the app, safety
+//! reports) is behind [`Ctx::world`], [`Ctx::grids`], [`Ctx::players`], [`Ctx::permissions`],
+//! [`Ctx::access`] and [`Ctx::safety`], each needing a scope the node type declares in the
+//! manifest; see [`node`].
 //!
 //! Hubs also get platform events, each a default no-op on [`Hub`]: timers they set
 //! ([`Hub::on_timer`]), topics they watch ([`Hub::on_topic`]), players entering and leaving
 //! the app ([`Hub::on_presence`], root hub only) and players' connections subscribing to them
 //! ([`Hub::on_session`]). A timer can follow a cron schedule, the legacy automations' syntax:
-//! see [`cron`] and [`Ctx::timer_cron`].
+//! see [`cron`] and [`Ctx::timer_cron`]. Two more concern what a hub holds about a player:
+//! erasing it when their account is erased ([`Hub::on_player_erased`]) and exporting it
+//! ([`Hub::on_player_export`]); a hub that does not implement them answers "not implemented".
 //!
 //! Nodes are unit tested natively with `cargo test`: `testing` runs one against a fake of the
 //! platform (calls, timers, events, snapshots, the node API, a mod's grid). [`limits`] has the
@@ -63,12 +66,14 @@ pub mod rt;
 pub mod testing;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+/// What [`Hub::on_player_export`] answers in, for a crate that does not depend on it itself.
+pub use serde_json;
 
 pub mod prelude {
     pub use crate::cron::Cron;
     pub use crate::emit::{Spatial, actor_id};
     pub use crate::model::{Model, PropKind, Schema, Viewer, Visibility};
-    pub use crate::node::{ChunkPos, GridPick, VoxelWrite};
+    pub use crate::node::{AgeBracket, ChunkPos, GridPick, ReportReason, SafetyReport, VoxelWrite};
     pub use crate::{
         Call, CallError, Caller, Ctx, Error, Hub, Kind, Level, Presence, PresencePlayer, Result, Session, Spoke, Status, TopicMsg,
         WorldEvent, decode, encode,
@@ -87,6 +92,13 @@ impl Error {
 
     pub fn unknown_method(method: &str) -> Self {
         Self(format!("unknown method `{method}`"))
+    }
+
+    /// What a hook the hub does not implement answers ([`Hub::on_player_erased`],
+    /// [`Hub::on_player_export`]). The platform tells it from a failure: it records it and goes
+    /// on.
+    pub fn not_implemented(hook: &str) -> Self {
+        Self(format!("not implemented: `{hook}`"))
     }
 }
 
@@ -446,6 +458,11 @@ impl Ctx {
         node::Access(self)
     }
 
+    /// Safety reports a player files through this hub (scope `safety.write`).
+    pub fn safety(&self) -> node::Safety<'_> {
+        node::Safety(self)
+    }
+
     pub fn log(&self, level: Level, msg: &str) {
         abi::log(level as u32, msg);
     }
@@ -527,6 +544,22 @@ pub trait Hub: Sized + 'static {
     /// not running, and this is its first call after `spawn` or `load`.
     fn on_world(&mut self, _ctx: &Ctx, _events: &[WorldEvent]) -> Result<()> {
         Ok(())
+    }
+    /// `player`'s account is being erased: delete or anonymize everything this hub holds about
+    /// them. Every hub of the app that holds state hears it, a stopped one started for it,
+    /// the player's own included (one keyed by their id, which the platform then deletes with
+    /// its snapshot). The platform counts the hub done once a snapshot taken after this returns
+    /// is stored; an error is recorded, and the erasure asks again later. Left out, the hub
+    /// answers "not implemented", which is recorded and does not hold the erasure up.
+    fn on_player_erased(&mut self, _ctx: &Ctx, _player: u64) -> Result<()> {
+        Err(Error::not_implemented("on_player_erased"))
+    }
+    /// What this hub holds about `player`, for their data export: JSON, at most
+    /// [`limits::MAX_EXPORT_BYTES`] of it, or `Value::Null` when it holds nothing. Every hub of
+    /// the app that holds state is asked, a stopped one started for it. Left out, the hub
+    /// answers "not implemented", which the export records.
+    fn on_player_export(&mut self, _ctx: &Ctx, _player: u64) -> Result<serde_json::Value> {
+        Err(Error::not_implemented("on_player_export"))
     }
 }
 
