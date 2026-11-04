@@ -1,7 +1,7 @@
 # The platform toolchain release this kit was copied from (sync-kit.sh in the platform's
 # repository). The paths in `copied` are byte-identical to it: change them there, never here.
 toolchain_version=v1.16.0
-toolchain_commit=9423aa5f66b5480f2aa19110b6888d3e04c4534d
+toolchain_commit=cca582f137bbb427b2815dcfeb975cf90f501a18
 sdk_commit=27d5774d7b9d3b3c28928ad1a4d27902ac5130e1
 ckx_sdk_version=0.13.0
 crowdy_client_sdk_version=0.1.0
