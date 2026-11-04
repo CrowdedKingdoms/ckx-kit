@@ -1,10 +1,11 @@
 //! Typed node API operations: the platform's world, grid, player, permission and access data,
-//! always within this instance's app. Each needs a scope its node type declares in the manifest
-//! (`"scopes": ["world.read", ...]`); without it the call fails with [`Status::Denied`].
+//! and safety reports, always within this instance's app. Each needs a scope its node type
+//! declares in the manifest (`"scopes": ["world.read", ...]`); without it the call fails with
+//! [`Status::Denied`].
 //!
 //! | Scope | Operations |
 //! |---|---|
-//! | `players.read` | [`Players::get`], [`Players::features`], [`Players::check_permission`], [`Players::state`], [`Players::avatar_state`] |
+//! | `players.read` | [`Players::get`], [`Players::features`], [`Players::check_permission`], [`Players::state`], [`Players::avatar_state`], [`Players::blocked`] |
 //! | `players.write` | [`Players::set_state`] |
 //! | `world.read` | [`World::chunk`], [`World::voxels`], [`World::actors`], [`World::actors_near`] |
 //! | `world.write` | [`World::set_voxels`], [`World::set_chunk_state`] |
@@ -13,6 +14,7 @@
 //! | `permissions.write` | [`Permissions::grant`], [`Permissions::revoke`] |
 //! | `access.read` | [`Access::get`] |
 //! | `access.write` | [`Access::grant`], [`Access::revoke`], [`Access::suspend`], [`Access::unsuspend`] |
+//! | `safety.write` | [`Safety::report`] |
 //!
 //! The game API rate limits each app (reads and writes separately); a refusal is
 //! [`Status::RateLimited`].
@@ -31,6 +33,8 @@ pub const MAX_VOXEL_WRITES: usize = 16;
 pub const MAX_VOXEL_STATE: usize = 1024;
 /// A chunk's state bytes ([`World::set_chunk_state`]).
 pub const MAX_CHUNK_STATE: usize = 65_536;
+/// A safety report's details, in characters as the game API counts them (UTF-16 units).
+pub const MAX_REPORT_DETAILS: usize = 1_000;
 
 /// A chunk's coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -164,6 +168,85 @@ pub struct Player {
     /// What tells players with the same gamertag apart; most players have none.
     #[serde(default)]
     pub disambiguation: Option<String>,
+    /// The player's age bracket; `None` from a platform that does not say.
+    #[serde(default, alias = "ageBracket")]
+    pub age_bracket: Option<AgeBracket>,
+}
+
+/// How old a player is, as a bracket: never their age itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgeBracket {
+    /// No age is known: the platform refuses such a player a token, so a hub rarely sees one.
+    Unknown,
+    Under13,
+    From13To15,
+    From16To17,
+    Adult,
+}
+
+impl AgeBracket {
+    /// As the platform writes it: `unknown`, `under_13`, `13_15`, `16_17` or `18_plus`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgeBracket::Unknown => "unknown",
+            AgeBracket::Under13 => "under_13",
+            AgeBracket::From13To15 => "13_15",
+            AgeBracket::From16To17 => "16_17",
+            AgeBracket::Adult => "18_plus",
+        }
+    }
+
+    /// 13 to 17: the platform holds the player to minors' defaults.
+    pub fn is_minor(self) -> bool {
+        matches!(self, AgeBracket::From13To15 | AgeBracket::From16To17)
+    }
+}
+
+/// A bracket this SDK does not know reads as [`AgeBracket::Unknown`], the most guarded.
+impl<'de> Deserialize<'de> for AgeBracket {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        let known = [AgeBracket::Under13, AgeBracket::From13To15, AgeBracket::From16To17, AgeBracket::Adult];
+        Ok(known.into_iter().find(|b| b.as_str() == s).unwrap_or(AgeBracket::Unknown))
+    }
+}
+
+/// Why a player is reported ([`SafetyReport::reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportReason {
+    ChildSafety,
+    Harassment,
+    SexualContent,
+    Hate,
+    SelfHarm,
+    Cheating,
+    Other,
+}
+
+/// A safety report a hub files for one player about another ([`Safety::report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyReport {
+    /// The player reporting.
+    pub reporter: u64,
+    /// The player reported.
+    pub reported: u64,
+    /// The reported player's actor (its 32-character id), when the report is about what it
+    /// did in the world.
+    pub reported_actor: Option<String>,
+    pub reason: ReportReason,
+    /// What happened, in the reporter's words: at most [`MAX_REPORT_DETAILS`] characters.
+    pub details: String,
+    /// When it happened, in Unix milliseconds.
+    pub occurred_at_ms: u64,
+}
+
+/// A report the platform recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct FiledReport {
+    /// What moderators know it by.
+    #[serde(deserialize_with = "de_u64", alias = "reportId")]
+    pub report_id: u64,
 }
 
 /// A player's access to the app, from [`Access::get`] and [`Access::grant`].
@@ -199,6 +282,21 @@ fn op<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: Value) -> Result<R, Call
 
 fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
+}
+
+/// Unix milliseconds as the game API writes a time: `2026-01-01T00:00:00.000Z`.
+pub(crate) fn rfc3339(ms: u64) -> String {
+    let (secs, millis) = (ms / 1000, ms % 1000);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 // ---- wire shapes ----
@@ -585,6 +683,19 @@ impl Players<'_> {
         self.state_op("players.avatar_state", json!({ "avatar": avatar.to_string() }))
     }
 
+    /// Whether either player has blocked the other in this app: check it before mail, friend
+    /// requests, trades, duels or invites pass between them, and before the hub's own events
+    /// carry one's words to the other (the realtime servers pass what a hub emits, blocks or
+    /// not). Scope `players.read`.
+    pub fn blocked(&self, player: u64, other: u64) -> Result<bool, CallError> {
+        #[derive(Deserialize)]
+        struct R {
+            blocked: bool,
+        }
+        let r: R = op(self.0, "players.blocked", json!({ "player": player.to_string(), "other": other.to_string() }))?;
+        Ok(r.blocked)
+    }
+
     fn state_op(&self, name: &str, body: Value) -> Result<Option<Vec<u8>>, CallError> {
         #[derive(Deserialize)]
         struct R {
@@ -675,6 +786,31 @@ impl Access<'_> {
     pub fn unsuspend(&self, player: u64) -> Result<(), CallError> {
         let _: Value = op(self.0, "access.unsuspend", json!({ "player": player.to_string() }))?;
         Ok(())
+    }
+}
+
+/// Safety reports: [`Ctx::safety`].
+pub struct Safety<'a>(pub(crate) &'a Ctx);
+
+impl Safety<'_> {
+    /// Files `report` as its reporter would from the game, both players being the app's:
+    /// moderators review it with what the app's safety log recorded of both around when it
+    /// happened. Scope `safety.write`.
+    pub fn report(&self, report: &SafetyReport) -> Result<FiledReport, CallError> {
+        if report.details.encode_utf16().count() > MAX_REPORT_DETAILS {
+            return Err(bad_request(format!("a report's details are at most {MAX_REPORT_DETAILS} characters")));
+        }
+        let mut body = json!({
+            "reporter": report.reporter.to_string(),
+            "reported": report.reported.to_string(),
+            "reason": report.reason,
+            "details": report.details,
+            "occurred_at": rfc3339(report.occurred_at_ms),
+        });
+        if let Some(actor) = &report.reported_actor {
+            body["reported_actor"] = json!(actor);
+        }
+        op(self.0, "safety.report", body)
     }
 }
 
@@ -769,11 +905,96 @@ mod tests {
         let reply = json!({ "player": "42", "gamertag": "Ada", "disambiguation": null });
         let (got, name, body) = exchange(reply, |c| c.players().get(42));
         assert_eq!((name.as_str(), body), ("players.get", json!({ "player": "42" })));
-        assert_eq!(got.unwrap(), Player { player: 42, gamertag: "Ada".into(), disambiguation: None });
+        assert_eq!(got.unwrap(), Player { player: 42, gamertag: "Ada".into(), disambiguation: None, age_bracket: None });
         let (got, ..) = exchange(json!({ "player": 42, "gamertag": "Ada" }), |c| c.players().get(42));
         assert_eq!(got.unwrap().disambiguation, None, "a platform that leaves it out");
         let (got, ..) = exchange(json!({ "player": "42", "gamertag": "Ada", "disambiguation": "0001" }), |c| c.players().get(42));
         assert_eq!(got.unwrap().disambiguation.as_deref(), Some("0001"));
+    }
+
+    #[test]
+    fn a_player_names_their_age_bracket_and_an_older_platform_none() {
+        let get = |reply: Value| exchange(reply, |c| c.players().get(42)).0.unwrap().age_bracket;
+        assert_eq!(get(json!({ "player": "42", "gamertag": "Ada", "disambiguation": null })), None, "an older ck-api");
+        for (wire, bracket) in [
+            ("unknown", AgeBracket::Unknown),
+            ("under_13", AgeBracket::Under13),
+            ("13_15", AgeBracket::From13To15),
+            ("16_17", AgeBracket::From16To17),
+            ("18_plus", AgeBracket::Adult),
+        ] {
+            assert_eq!(get(json!({ "player": "42", "gamertag": "Ada", "age_bracket": wire })), Some(bracket), "{wire}");
+            assert_eq!(bracket.as_str(), wire);
+        }
+        assert_eq!(get(json!({ "player": "42", "gamertag": "Ada", "ageBracket": "16_17" })), Some(AgeBracket::From16To17));
+        assert_eq!(get(json!({ "player": "42", "gamertag": "Ada", "age_bracket": null })), None);
+        assert_eq!(
+            get(json!({ "player": "42", "gamertag": "Ada", "age_bracket": "21_plus" })),
+            Some(AgeBracket::Unknown),
+            "one it does not know"
+        );
+        assert!(AgeBracket::From13To15.is_minor() && AgeBracket::From16To17.is_minor());
+        assert!(!AgeBracket::Adult.is_minor() && !AgeBracket::Unknown.is_minor() && !AgeBracket::Under13.is_minor());
+    }
+
+    #[test]
+    fn whether_either_player_blocked_the_other() {
+        let (got, name, body) = exchange(json!({ "blocked": true }), |c| c.players().blocked(42, u64::MAX));
+        assert!(got.unwrap());
+        assert_eq!((name.as_str(), body), ("players.blocked", json!({ "player": "42", "other": "18446744073709551615" })));
+        let (got, ..) = exchange(json!({ "blocked": false }), |c| c.players().blocked(42, 43));
+        assert!(!got.unwrap());
+        let (got, ..) = exchange(json!({}), |c| c.players().blocked(42, 43));
+        assert_eq!(got.unwrap_err().status, Status::Internal, "a reply without the answer");
+    }
+
+    #[test]
+    fn a_safety_report_sends_what_the_game_api_reads_and_its_id_comes_back() {
+        let report = SafetyReport {
+            reporter: 42,
+            reported: u64::MAX,
+            reported_actor: Some("0123456789abcdef0123456789abcdef".into()),
+            reason: ReportReason::SexualContent,
+            details: "asked for pictures".into(),
+            occurred_at_ms: 951_782_400_123,
+        };
+        let (got, name, body) = exchange(json!({ "report_id": "77" }), |c| c.safety().report(&report));
+        assert_eq!(got.unwrap(), FiledReport { report_id: 77 });
+        assert_eq!(name, "safety.report");
+        assert_eq!(
+            body,
+            json!({ "reporter": "42", "reported": "18446744073709551615", "reported_actor": "0123456789abcdef0123456789abcdef",
+                    "reason": "sexual_content", "details": "asked for pictures", "occurred_at": "2000-02-29T00:00:00.123Z" })
+        );
+        let no_actor = SafetyReport { reported_actor: None, reason: ReportReason::ChildSafety, ..report.clone() };
+        let (got, _, body) = exchange(json!({ "report_id": 78 }), |c| c.safety().report(&no_actor));
+        assert_eq!(got.unwrap().report_id, 78);
+        assert!(body.get("reported_actor").is_none(), "left out when there is none");
+        assert_eq!(body["reason"], "child_safety");
+        let (got, ..) = exchange(json!({ "reportId": "79" }), |c| c.safety().report(&no_actor));
+        assert_eq!(got.unwrap().report_id, 79);
+        for (reason, wire) in [
+            (ReportReason::Harassment, "harassment"),
+            (ReportReason::Hate, "hate"),
+            (ReportReason::SelfHarm, "self_harm"),
+            (ReportReason::Cheating, "cheating"),
+            (ReportReason::Other, "other"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), wire);
+        }
+
+        let at_cap = SafetyReport { details: "\u{1F600}".repeat(MAX_REPORT_DETAILS / 2), ..no_actor.clone() };
+        let (got, ..) = exchange(json!({ "report_id": "80" }), |c| c.safety().report(&at_cap));
+        assert!(got.is_ok(), "the cap itself is allowed");
+        let over = SafetyReport { details: format!("{}a", "\u{1F600}".repeat(MAX_REPORT_DETAILS / 2)), ..no_actor };
+        assert_eq!(refused_here(|c| c.safety().report(&over)).status, Status::BadRequest, "counted as the game API counts");
+    }
+
+    #[test]
+    fn writes_times_as_the_game_api_does() {
+        assert_eq!(rfc3339(1_767_225_600_000), "2026-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(951_782_400_123), "2000-02-29T00:00:00.123Z");
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]
