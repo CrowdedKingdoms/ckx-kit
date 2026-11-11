@@ -27,10 +27,17 @@ use serde_json::{Value, json};
 
 use crate::{CallError, Ctx, Status};
 
-/// Voxel writes in one [`World::set_voxels`] call.
-pub const MAX_VOXEL_WRITES: usize = 16;
+/// Voxel writes in one [`World::set_voxels`] call: a whole 16×16×16 chunk's worth.
+pub const MAX_VOXEL_WRITES: usize = 4096;
+/// The voxel states of one [`World::set_voxels`] or [`World::set_chunk`] call together, so the
+/// call stays well under the platform's message limit once encoded.
+pub const MAX_VOXEL_WRITE_BYTES: usize = 2 << 20;
 /// A voxel's state bytes.
 pub const MAX_VOXEL_STATE: usize = 1024;
+/// A [`World::set_chunk`] grid: one type byte per voxel of the 16×16×16 chunk.
+pub const CHUNK_GRID_BYTES: usize = 4096;
+/// Voxel states stored with one [`World::set_chunk`].
+pub const MAX_CHUNK_STATES: usize = 4096;
 /// A chunk's state bytes ([`World::set_chunk_state`]).
 pub const MAX_CHUNK_STATE: usize = 65_536;
 /// A safety report's details, in characters as the game API counts them (UTF-16 units).
@@ -88,6 +95,15 @@ pub struct VoxelWrite {
     /// dense grid keeps to 0 to 15 on each axis.
     pub voxel: (i16, i16, i16),
     /// What a type means is up to the app.
+    pub voxel_type: i16,
+    pub state: Option<Vec<u8>>,
+}
+
+/// One voxel's state stored with a [`World::set_chunk`]: the voxel, its type and its bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkVoxelState {
+    /// `(x, y, z)` within the chunk.
+    pub voxel: (i16, i16, i16),
     pub voxel_type: i16,
     pub state: Option<Vec<u8>>,
 }
@@ -268,6 +284,21 @@ pub struct PlayerAccess {
 
 fn bad_reply(op: &str, e: impl std::fmt::Display) -> CallError {
     CallError { status: Status::Internal, message: format!("unexpected {op} reply: {e}") }
+}
+
+/// Refuses a voxel state over [`MAX_VOXEL_STATE`], or states over [`MAX_VOXEL_WRITE_BYTES`] together.
+fn check_state_bytes<'a>(states: impl Iterator<Item = Option<&'a [u8]>>) -> Result<(), CallError> {
+    let mut total = 0usize;
+    for s in states.flatten() {
+        if s.len() > MAX_VOXEL_STATE {
+            return Err(bad_request(format!("a voxel's state is at most {MAX_VOXEL_STATE} bytes")));
+        }
+        total += s.len();
+    }
+    if total > MAX_VOXEL_WRITE_BYTES {
+        return Err(bad_request(format!("the voxel states of one call are at most {MAX_VOXEL_WRITE_BYTES} bytes together")));
+    }
+    Ok(())
 }
 
 fn bad_request(message: impl Into<String>) -> CallError {
@@ -481,17 +512,17 @@ impl World<'_> {
         Ok(r.voxels.into_iter().map(Voxel::from).collect())
     }
 
-    /// Writes up to [`MAX_VOXEL_WRITES`] voxels in one transaction, as the app, and shows them
-    /// to nearby players. Returns the voxel update ids. Scope `world.write`.
+    /// Writes up to [`MAX_VOXEL_WRITES`] voxels in one transaction, as the app, and shows each
+    /// to nearby players as a voxel update. Their states may hold [`MAX_VOXEL_WRITE_BYTES`]
+    /// together. Returns the voxel update ids. A call costs one write per started 64 voxels
+    /// ([`crate::limits::node`]). Scope `world.write`.
     pub fn set_voxels(&self, writes: &[VoxelWrite]) -> Result<Vec<u64>, CallError> {
         if writes.is_empty() || writes.len() > MAX_VOXEL_WRITES {
             return Err(bad_request(format!("write 1 to {MAX_VOXEL_WRITES} voxels per call")));
         }
+        check_state_bytes(writes.iter().map(|w| w.state.as_deref()))?;
         let mut list = Vec::with_capacity(writes.len());
         for w in writes {
-            if w.state.as_ref().is_some_and(|s| s.len() > MAX_VOXEL_STATE) {
-                return Err(bad_request(format!("a voxel's state is at most {MAX_VOXEL_STATE} bytes")));
-            }
             list.push(json!({
                 "chunk": w.chunk.json(),
                 "voxel": { "x": w.voxel.0, "y": w.voxel.1, "z": w.voxel.2 },
@@ -506,6 +537,39 @@ impl World<'_> {
         }
         let r: R = op(self.0, "world.set_voxels", json!({ "writes": list }))?;
         r.voxel_update_ids.iter().map(|id| id.parse().map_err(|e| bad_reply("world.set_voxels", e))).collect()
+    }
+
+    /// Replaces the chunk at `chunk` with `grid` (one type byte per voxel, index
+    /// `x + y*16 + z*256`) and `states`, and drops every voxel written into it before, so it
+    /// reads back exactly as written; its own state blob ([`World::set_chunk_state`]) is kept.
+    /// Nearby players are told once to read the chunk again rather than sent a voxel update per
+    /// voxel, so this is the cheap way to change most of a chunk; the grid's mods hear it as
+    /// `voxels`. A call costs one write plus one per started 64 states ([`crate::limits::node`]).
+    /// Scope `world.write`; a mod may set chunks only inside its grid, where its owner may edit.
+    pub fn set_chunk(&self, chunk: ChunkPos, grid: &[u8], states: &[ChunkVoxelState]) -> Result<(), CallError> {
+        if grid.len() != CHUNK_GRID_BYTES {
+            return Err(bad_request(format!("a chunk grid is {CHUNK_GRID_BYTES} bytes, one per voxel")));
+        }
+        if states.len() > MAX_CHUNK_STATES {
+            return Err(bad_request(format!("at most {MAX_CHUNK_STATES} voxel states per chunk")));
+        }
+        check_state_bytes(states.iter().map(|s| s.state.as_deref()))?;
+        let list: Vec<Value> = states
+            .iter()
+            .map(|s| {
+                json!({
+                    "voxel": { "x": s.voxel.0, "y": s.voxel.1, "z": s.voxel.2 },
+                    "voxelType": s.voxel_type,
+                    "stateBase64": s.state.as_deref().map(b64),
+                })
+            })
+            .collect();
+        let mut body = json!({ "chunk": chunk.json(), "gridBase64": b64(grid) });
+        if !list.is_empty() {
+            body["states"] = Value::Array(list);
+        }
+        let _: Value = op(self.0, "world.set_chunk", body)?;
+        Ok(())
     }
 
     /// Replaces the chunk's own state blob, the one [`Chunk::chunk_state`] reads (at most
@@ -1040,6 +1104,50 @@ mod tests {
         );
         let big = VoxelWrite { state: Some(vec![0; MAX_VOXEL_STATE + 1]), ..w };
         assert_eq!(refused_here(|c| c.world().set_voxels(&[big])).status, Status::BadRequest);
+    }
+
+    #[test]
+    fn a_whole_chunk_of_voxels_fits_one_set_voxels_and_the_states_share_a_cap() {
+        let at = |i: usize| VoxelWrite {
+            chunk: ChunkPos::new(0, 0, 0),
+            voxel: ((i % 16) as i16, (i / 16 % 16) as i16, (i / 256) as i16),
+            voxel_type: 1,
+            state: None,
+        };
+        let all: Vec<VoxelWrite> = (0..MAX_VOXEL_WRITES).map(at).collect();
+        let ids: Vec<String> = (0..MAX_VOXEL_WRITES).map(|i| i.to_string()).collect();
+        let (got, _, _) = exchange(json!({ "voxelUpdateIds": ids }), |c| c.world().set_voxels(&all));
+        assert_eq!(got.unwrap().len(), MAX_VOXEL_WRITES);
+        let one_more: Vec<VoxelWrite> = (0..=MAX_VOXEL_WRITES).map(at).collect();
+        assert_eq!(refused_here(|c| c.world().set_voxels(&one_more)).status, Status::BadRequest);
+        // 2,049 states of 1,024 bytes pass the shared 2 MiB.
+        let heavy: Vec<VoxelWrite> = (0..2049).map(|i| VoxelWrite { state: Some(vec![0; MAX_VOXEL_STATE]), ..at(i) }).collect();
+        assert_eq!(refused_here(|c| c.world().set_voxels(&heavy)).status, Status::BadRequest);
+    }
+
+    #[test]
+    fn set_chunk_sends_the_grid_and_its_states() {
+        let grid = vec![3u8; CHUNK_GRID_BYTES];
+        let states = vec![ChunkVoxelState { voxel: (1, 2, 3), voxel_type: -4, state: Some(vec![9]) }];
+        let (got, name, body) = exchange(json!({ "updatedAt": "t" }), |c| c.world().set_chunk(ChunkPos::new(7, 0, -2), &grid, &states));
+        got.unwrap();
+        assert_eq!(name, "world.set_chunk");
+        assert_eq!(body["chunk"], pos(7, 0, -2));
+        assert_eq!(B64.decode(body["gridBase64"].as_str().unwrap()).unwrap(), grid);
+        assert_eq!(body["states"], json!([{ "voxel": { "x": 1, "y": 2, "z": 3 }, "voxelType": -4, "stateBase64": "CQ==" }]));
+        let (_, _, bare) = exchange(json!({ "updatedAt": "t" }), |c| c.world().set_chunk(ChunkPos::default(), &grid, &[]));
+        assert!(bare.get("states").is_none(), "no states, no list");
+    }
+
+    #[test]
+    fn set_chunk_refuses_a_wrong_grid_or_too_many_states_before_sending() {
+        let short = vec![0u8; CHUNK_GRID_BYTES - 1];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &short, &[])).status, Status::BadRequest);
+        let grid = vec![0u8; CHUNK_GRID_BYTES];
+        let many = vec![ChunkVoxelState { voxel: (0, 0, 0), voxel_type: 1, state: None }; MAX_CHUNK_STATES + 1];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &grid, &many)).status, Status::BadRequest);
+        let big = vec![ChunkVoxelState { voxel: (0, 0, 0), voxel_type: 1, state: Some(vec![0; MAX_VOXEL_STATE + 1]) }];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &grid, &big)).status, Status::BadRequest);
     }
 
     #[test]
