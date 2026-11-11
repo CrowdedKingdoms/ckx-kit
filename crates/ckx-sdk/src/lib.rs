@@ -73,7 +73,7 @@ pub mod prelude {
     pub use crate::cron::Cron;
     pub use crate::emit::{Spatial, actor_id};
     pub use crate::model::{Model, PropKind, Schema, Viewer, Visibility};
-    pub use crate::node::{AgeBracket, ChunkPos, GridPick, ReportReason, SafetyReport, VoxelWrite};
+    pub use crate::node::{AgeBracket, ChunkPos, ChunkVoxelState, GridPick, ReportReason, SafetyReport, VoxelWrite};
     pub use crate::{
         Call, CallError, Caller, Ctx, Error, Hub, Kind, Level, Presence, PresencePlayer, Result, Session, Spoke, Status, TopicMsg,
         WorldEvent, decode, encode,

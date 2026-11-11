@@ -1,9 +1,9 @@
 # The platform toolchain release this kit was copied from (sync-kit.sh in the platform's
 # repository). The paths in `copied` are byte-identical to it: change them there, never here.
-toolchain_version=v1.16.0
-toolchain_commit=c3cb02186b34ad535dd30c333ab4d9b116e5866d
-sdk_commit=27d5774d7b9d3b3c28928ad1a4d27902ac5130e1
-ckx_sdk_version=0.13.0
+toolchain_version=v1.17.0
+toolchain_commit=a3c5049209c6633e0f65480eafe3be4a40530a32
+sdk_commit=cc5b85b2adfc1214bf8e61a24f3d0ac7e0cedc6d
+ckx_sdk_version=0.14.0
 crowdy_client_sdk_version=0.1.0
 rust_version=1.97.1
 copied=crates/ckx-sdk/src crates/crowdy-client-sdk/src tools/instrument/Cargo.toml tools/instrument/Cargo.lock tools/instrument/src checks/src/build/exec-source.ts checks/src/build/exec-source.spec.ts checks/src/build/rust-source-guard.ts checks/src/build/rust-source-guard.spec.ts checks/src/build/wasm-inspect.ts checks/src/build/wasm-inspect.spec.ts checks/src/build/client-capabilities.ts checks/src/build/client-capabilities.spec.ts checks/src/test-support/wasm-module.ts checks/compute-toolchain/host-catalog.json starters rust-toolchain.toml vendor.lock
