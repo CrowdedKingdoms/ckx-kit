@@ -307,8 +307,130 @@ fn bad_request(message: impl Into<String>) -> CallError {
 
 fn op<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: Value) -> Result<R, CallError> {
     let body = serde_json::to_vec(&body).map_err(|e| bad_request(e.to_string()))?;
-    let bytes = ctx.node(name, &body)?;
+    op_bytes(ctx, name, &body)
+}
+
+fn op_bytes<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: &[u8]) -> Result<R, CallError> {
+    let bytes = ctx.node(name, body)?;
     serde_json::from_slice(&bytes).map_err(|e| bad_reply(name, e))
+}
+
+/// A request body written straight into bytes, for the batch writes. A `json!` tree costs a mod
+/// about 25,000 fuel per voxel write, so a 20,000,000-fuel call fits about 750 of them; this
+/// costs about 1,300. Keys are in the order `json!` writes them (sorted).
+struct Body(Vec<u8>);
+
+impl Body {
+    fn with_capacity(bytes: usize) -> Self {
+        Self(Vec::with_capacity(bytes))
+    }
+
+    fn raw(&mut self, text: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(text);
+        self
+    }
+
+    fn int(&mut self, v: i64) -> &mut Self {
+        if v < 0 {
+            self.0.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.0.extend_from_slice(&digits[at..]);
+        self
+    }
+
+    /// `{"x":"1","y":"-2","z":"3"}`: a chunk position, as [`ChunkPos::json`] writes it.
+    fn chunk(&mut self, at: ChunkPos) -> &mut Self {
+        self.raw(b"{\"x\":\"").int(at.x).raw(b"\",\"y\":\"").int(at.y).raw(b"\",\"z\":\"").int(at.z).raw(b"\"}")
+    }
+
+    fn voxel(&mut self, (x, y, z): (i16, i16, i16)) -> &mut Self {
+        self.raw(b"{\"x\":").int(x.into()).raw(b",\"y\":").int(y.into()).raw(b",\"z\":").int(z.into()).raw(b"}")
+    }
+
+    fn base64_or_null(&mut self, bytes: Option<&[u8]>) -> &mut Self {
+        match bytes {
+            Some(b) => {
+                self.0.push(b'"');
+                let start = self.0.len();
+                self.0.resize(start + base64::encoded_len(b.len(), true).unwrap_or(0), 0);
+                let written = B64.encode_slice(b, &mut self.0[start..]).unwrap_or(0);
+                self.0.truncate(start + written);
+                self.0.push(b'"');
+            }
+            None => self.0.extend_from_slice(b"null"),
+        }
+        self
+    }
+
+    /// The `stateBase64`, `voxel` and `voxelType` of one write or state, without its braces.
+    fn voxel_fields(&mut self, voxel: (i16, i16, i16), voxel_type: i16, state: Option<&[u8]>) -> &mut Self {
+        self.raw(b"\"stateBase64\":").base64_or_null(state).raw(b",\"voxel\":").voxel(voxel).raw(b",\"voxelType\":").int(voxel_type.into())
+    }
+}
+
+fn set_voxels_body(writes: &[VoxelWrite]) -> Vec<u8> {
+    let state_bytes: usize = writes.iter().filter_map(|w| w.state.as_ref()).map(|s| s.len() * 4 / 3 + 4).sum();
+    let mut body = Body::with_capacity(16 + writes.len() * 112 + state_bytes);
+    body.raw(b"{\"writes\":[");
+    for (i, w) in writes.iter().enumerate() {
+        if i > 0 {
+            body.raw(b",");
+        }
+        body.raw(b"{\"chunk\":").chunk(w.chunk).raw(b",").voxel_fields(w.voxel, w.voxel_type, w.state.as_deref()).raw(b"}");
+    }
+    body.raw(b"]}");
+    body.0
+}
+
+fn set_chunk_body(chunk: ChunkPos, grid: &[u8], states: &[ChunkVoxelState]) -> Vec<u8> {
+    let state_bytes: usize = states.iter().filter_map(|s| s.state.as_ref()).map(|s| s.len() * 4 / 3 + 4).sum();
+    let mut body = Body::with_capacity(5_600 + states.len() * 80 + state_bytes);
+    body.raw(b"{\"chunk\":").chunk(chunk).raw(b",\"gridBase64\":").base64_or_null(Some(grid));
+    if !states.is_empty() {
+        body.raw(b",\"states\":[");
+        for (i, s) in states.iter().enumerate() {
+            if i > 0 {
+                body.raw(b",");
+            }
+            body.raw(b"{").voxel_fields(s.voxel, s.voxel_type, s.state.as_deref()).raw(b"}");
+        }
+        body.raw(b"]");
+    }
+    body.raw(b"}");
+    body.0
+}
+
+/// An id the game API writes as a string, read without allocating one.
+struct WireId(u64);
+
+impl<'de> Deserialize<'de> for WireId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = WireId;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("an id")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<WireId, E> {
+                s.parse().map(WireId).map_err(E::custom)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<WireId, E> {
+                Ok(WireId(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -521,22 +643,13 @@ impl World<'_> {
             return Err(bad_request(format!("write 1 to {MAX_VOXEL_WRITES} voxels per call")));
         }
         check_state_bytes(writes.iter().map(|w| w.state.as_deref()))?;
-        let mut list = Vec::with_capacity(writes.len());
-        for w in writes {
-            list.push(json!({
-                "chunk": w.chunk.json(),
-                "voxel": { "x": w.voxel.0, "y": w.voxel.1, "z": w.voxel.2 },
-                "voxelType": w.voxel_type,
-                "stateBase64": w.state.as_deref().map(b64),
-            }));
-        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct R {
-            voxel_update_ids: Vec<String>,
+            voxel_update_ids: Vec<WireId>,
         }
-        let r: R = op(self.0, "world.set_voxels", json!({ "writes": list }))?;
-        r.voxel_update_ids.iter().map(|id| id.parse().map_err(|e| bad_reply("world.set_voxels", e))).collect()
+        let r: R = op_bytes(self.0, "world.set_voxels", &set_voxels_body(writes))?;
+        Ok(r.voxel_update_ids.into_iter().map(|id| id.0).collect())
     }
 
     /// Replaces the chunk at `chunk` with `grid` (one type byte per voxel, index
@@ -554,21 +667,7 @@ impl World<'_> {
             return Err(bad_request(format!("at most {MAX_CHUNK_STATES} voxel states per chunk")));
         }
         check_state_bytes(states.iter().map(|s| s.state.as_deref()))?;
-        let list: Vec<Value> = states
-            .iter()
-            .map(|s| {
-                json!({
-                    "voxel": { "x": s.voxel.0, "y": s.voxel.1, "z": s.voxel.2 },
-                    "voxelType": s.voxel_type,
-                    "stateBase64": s.state.as_deref().map(b64),
-                })
-            })
-            .collect();
-        let mut body = json!({ "chunk": chunk.json(), "gridBase64": b64(grid) });
-        if !list.is_empty() {
-            body["states"] = Value::Array(list);
-        }
-        let _: Value = op(self.0, "world.set_chunk", body)?;
+        let _: Value = op_bytes(self.0, "world.set_chunk", &set_chunk_body(chunk, grid, states))?;
         Ok(())
     }
 
@@ -880,6 +979,59 @@ impl Safety<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn written_batch_bodies_parse_as_the_json_trees_did() {
+        let writes = [
+            VoxelWrite {
+                chunk: ChunkPos::new(-9_000_000_000_000, 0, 7),
+                voxel: (i16::MIN, -1, i16::MAX),
+                voxel_type: i16::MIN,
+                state: Some(vec![0, 255, 7, 1]),
+            },
+            VoxelWrite { chunk: ChunkPos::new(1, -2, 3), voxel: (0, 15, 15), voxel_type: 9, state: None },
+            VoxelWrite { chunk: ChunkPos::new(i64::MAX, i64::MIN, 0), voxel: (1, 2, 3), voxel_type: 0, state: Some(vec![]) },
+        ];
+        let tree = json!({ "writes": writes.iter().map(|w| json!({
+            "chunk": w.chunk.json(),
+            "voxel": { "x": w.voxel.0, "y": w.voxel.1, "z": w.voxel.2 },
+            "voxelType": w.voxel_type,
+            "stateBase64": w.state.as_deref().map(b64),
+        })).collect::<Vec<_>>() });
+        let written = set_voxels_body(&writes);
+        assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), tree);
+        assert_eq!(written, serde_json::to_vec(&tree).unwrap(), "byte for byte, as json! writes it");
+
+        let grid: Vec<u8> = (0..CHUNK_GRID_BYTES).map(|i| (i % 251) as u8).collect();
+        let states = [
+            ChunkVoxelState { voxel: (-5, 0, 300), voxel_type: -2, state: Some(vec![9; 40]) },
+            ChunkVoxelState { voxel: (1, 1, 1), voxel_type: 4, state: None },
+        ];
+        let at = ChunkPos::new(-1, 2, -3);
+        let tree = json!({
+            "chunk": at.json(),
+            "gridBase64": b64(&grid),
+            "states": states.iter().map(|s| json!({
+                "voxel": { "x": s.voxel.0, "y": s.voxel.1, "z": s.voxel.2 },
+                "voxelType": s.voxel_type,
+                "stateBase64": s.state.as_deref().map(b64),
+            })).collect::<Vec<_>>(),
+        });
+        assert_eq!(serde_json::from_slice::<Value>(&set_chunk_body(at, &grid, &states)).unwrap(), tree);
+        let bare: Value = serde_json::from_slice(&set_chunk_body(at, &grid, &[])).unwrap();
+        assert_eq!(bare, json!({ "chunk": at.json(), "gridBase64": b64(&grid) }), "no states key when there are none");
+    }
+
+    #[test]
+    fn ids_read_from_strings_or_numbers() {
+        #[derive(Deserialize)]
+        struct R {
+            ids: Vec<WireId>,
+        }
+        let r: R = serde_json::from_str(r#"{"ids":["111458139590656",7]}"#).unwrap();
+        assert_eq!(r.ids.iter().map(|i| i.0).collect::<Vec<_>>(), vec![111_458_139_590_656, 7]);
+        assert!(serde_json::from_str::<R>(r#"{"ids":["x"]}"#).is_err());
+    }
+
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
