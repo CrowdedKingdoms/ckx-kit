@@ -1,7 +1,7 @@
 //! The platform's bounds on a node: what its sandbox and its checks hold every call, snapshot
 //! and module to. [`crate::testing`] applies the ones a native test can see.
 
-pub use crate::node::{MAX_CHUNK_STATE, MAX_VOXEL_STATE, MAX_VOXEL_WRITES};
+pub use crate::node::{CHUNK_GRID_BYTES, MAX_CHUNK_STATE, MAX_CHUNK_STATES, MAX_VOXEL_STATE, MAX_VOXEL_WRITE_BYTES, MAX_VOXEL_WRITES};
 pub use crate::rt::{MAX_TIMERS, MAX_WATCHES, MIN_TIMER_MS};
 
 /// The largest payload a node may send in one message, and the largest reply it may return. A
@@ -52,4 +52,18 @@ pub mod mods {
     pub const WORLD_BATCH_MAX: usize = 512;
     /// The node API scopes every mod holds, each confined to its grid.
     pub const SCOPES: [&str; 3] = ["grids.read", "world.read", "world.write"];
+}
+
+/// What the game API's node API allows an app on each of its replicas. An app's own code and its
+/// players' mods draw on separate buckets, so no player's mod can spend the app's. Past it a call
+/// answers [`crate::Status::RateLimited`]; retry after a moment.
+pub mod node {
+    /// Units per second; a bucket holds two seconds' worth for a burst.
+    pub const READ_UNITS_PER_SEC: u32 = 200;
+    pub const WRITE_UNITS_PER_SEC: u32 = 50;
+    pub const BURST_SECONDS: u32 = 2;
+    /// Voxels one write unit pays for: a `set_voxels` of 4,096 voxels costs 64 units, and a
+    /// `set_chunk` costs one unit plus one per started 64 states. A chunk state costs one unit per
+    /// started 4 KiB, and any other call one unit.
+    pub const VOXELS_PER_WRITE_UNIT: usize = 64;
 }
