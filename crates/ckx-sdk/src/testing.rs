@@ -847,11 +847,19 @@ pub fn player_payload(player: u64) -> crate::Result<Vec<u8>> {
 // ---- the node API, as it serves a mod ----
 
 /// The node API operations a mod may call.
-const MOD_OPS: [&str; 7] =
-    ["world.chunk", "world.voxels", "world.actors", "world.actors_radius", "world.set_voxels", "grids.get", "grids.check_permission"];
+const MOD_OPS: [&str; 8] = [
+    "world.chunk",
+    "world.voxels",
+    "world.actors",
+    "world.actors_radius",
+    "world.set_voxels",
+    "world.set_chunk",
+    "grids.get",
+    "grids.check_permission",
+];
 
 /// Each node API operation and the scope it needs.
-const OP_SCOPES: [(&str, &str); 29] = [
+const OP_SCOPES: [(&str, &str); 30] = [
     ("players.get", "players.read"),
     ("players.features", "players.read"),
     ("players.check_permission", "players.read"),
@@ -864,6 +872,7 @@ const OP_SCOPES: [(&str, &str); 29] = [
     ("world.actors", "world.read"),
     ("world.actors_radius", "world.read"),
     ("world.set_voxels", "world.write"),
+    ("world.set_chunk", "world.write"),
     ("world.set_chunk_state", "world.write"),
     ("grids.get", "grids.read"),
     ("grids.check_permission", "grids.read"),
@@ -998,10 +1007,11 @@ struct FakeChunk {
 
 /// A mod's grid as the node API serves it to the mod: the box, its owner, the chunks and
 /// voxels in it, the actors there and its permissions, under the node API's rules for mods.
-/// A mod calls seven operations (`world.chunk`, `world.voxels`, `world.actors`,
-/// `world.actors_radius`, `world.set_voxels`, `grids.get`, `grids.check_permission`), only
-/// inside its grid; writes voxels only where its owner may edit them; and is refused
-/// everything once its owner no longer owns the grid. A refusal reads as the game API's.
+/// A mod calls eight operations (`world.chunk`, `world.voxels`, `world.actors`,
+/// `world.actors_radius`, `world.set_voxels`, `world.set_chunk`, `grids.get`,
+/// `grids.check_permission`), only inside its grid; writes voxels and chunks only where its
+/// owner may edit them; and is refused everything once its owner no longer owns the grid. A
+/// refusal reads as the game API's.
 #[derive(Debug, Clone)]
 pub struct FakeGrid {
     id: u64,
@@ -1223,6 +1233,11 @@ impl FakeGrid {
             return Err(refusal(403, &format!("the capability lacks scope {scope}")));
         }
         let writes = if op == "world.set_voxels" { voxel_writes(body)? } else { Vec::new() };
+        let (states, grid) = if op == "world.set_chunk" {
+            (chunk_states(body)?, base64_bytes(body.get("gridBase64"), "gridBase64", crate::node::CHUNK_GRID_BYTES)?)
+        } else {
+            (Vec::new(), None)
+        };
         if op == "world.set_chunk_state" {
             base64_bytes(body.get("stateBase64"), "stateBase64", crate::node::MAX_CHUNK_STATE)?;
         }
@@ -1289,6 +1304,49 @@ impl FakeGrid {
                 }
                 Ok(json!({ "voxelUpdateIds": ids }))
             }
+            "world.set_chunk" => {
+                let at = chunk_pos(body.get("chunk"), "chunk")?;
+                self.inside(at, 0, 0)?;
+                if self.closed.contains(&key(at)) {
+                    return Err(refusal(
+                        403,
+                        &format!(
+                            "the mod's owner may not edit voxels at chunk ({}, {}, {}): the most specific grid there does not grant them 'update_voxel_data'",
+                            at.x, at.y, at.z
+                        ),
+                    ));
+                }
+                let grid = grid.ok_or_else(|| {
+                    refusal(400, &format!("gridBase64 must hold the chunk's {} voxel bytes", crate::node::CHUNK_GRID_BYTES))
+                })?;
+                if grid.len() != crate::node::CHUNK_GRID_BYTES {
+                    return Err(refusal(400, &format!("a chunk grid is {} bytes, one per voxel", crate::node::CHUNK_GRID_BYTES)));
+                }
+                let next_id = self.next_update;
+                let chunk = self.chunks.entry(key(at)).or_default();
+                let (id, chunk_state) = match &chunk.stored {
+                    Some(c) => (c.id, c.chunk_state.clone()),
+                    None => (next_id, None),
+                };
+                if chunk.stored.is_none() {
+                    self.next_update += 1;
+                }
+                chunk.stored = Some(Chunk { id, at, voxels: Some(grid), chunk_state });
+                chunk.edits.clear();
+                for s in states {
+                    let voxel = Voxel {
+                        x: s.voxel.0,
+                        y: s.voxel.1,
+                        z: s.voxel.2,
+                        voxel_type: s.voxel_type,
+                        state: s.state,
+                        created_by: Some("0".to_owned()),
+                        updated_at: Some(rfc3339(now)),
+                    };
+                    chunk.edits.insert((voxel.y, voxel.x, voxel.z), voxel);
+                }
+                Ok(json!({ "updatedAt": rfc3339(now) }))
+            }
             "grids.get" => {
                 self.own_grid(body)?;
                 Ok(json!({ "grid": self.grid_json() }))
@@ -1327,6 +1385,32 @@ fn voxel_writes(body: &Value) -> Result<Vec<Write>, CallError> {
             let voxel_type = int_in(w.get("voxelType"), &format!("writes[{i}].voxelType"), i16::MIN.into(), i16::MAX.into())? as i16;
             let state = base64_bytes(w.get("stateBase64"), &format!("writes[{i}].stateBase64"), crate::node::MAX_VOXEL_STATE)?;
             Ok(Write { chunk, voxel, voxel_type, state })
+        })
+        .collect()
+}
+
+struct StateWrite {
+    voxel: (i16, i16, i16),
+    voxel_type: i16,
+    state: Option<Vec<u8>>,
+}
+
+fn chunk_states(body: &Value) -> Result<Vec<StateWrite>, CallError> {
+    let max = crate::node::MAX_CHUNK_STATES;
+    let list = match body.get("states") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(l)) if l.len() <= max => l,
+        Some(_) => return Err(refusal(400, &format!("states must list at most {max} voxel states"))),
+    };
+    let axis = |v: &Value, i: usize, k: &str| int_in(v.get(k), &format!("states[{i}].voxel.{k}"), i16::MIN.into(), i16::MAX.into());
+    list.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let v = s.get("voxel").unwrap_or(&Value::Null);
+            let voxel = (axis(v, i, "x")? as i16, axis(v, i, "y")? as i16, axis(v, i, "z")? as i16);
+            let voxel_type = int_in(s.get("voxelType"), &format!("states[{i}].voxelType"), i16::MIN.into(), i16::MAX.into())? as i16;
+            let state = base64_bytes(s.get("stateBase64"), &format!("states[{i}].stateBase64"), crate::node::MAX_VOXEL_STATE)?;
+            Ok(StateWrite { voxel, voxel_type, state })
         })
         .collect()
 }
