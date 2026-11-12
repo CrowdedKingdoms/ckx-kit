@@ -27,10 +27,17 @@ use serde_json::{Value, json};
 
 use crate::{CallError, Ctx, Status};
 
-/// Voxel writes in one [`World::set_voxels`] call.
-pub const MAX_VOXEL_WRITES: usize = 16;
+/// Voxel writes in one [`World::set_voxels`] call: a whole 16×16×16 chunk's worth.
+pub const MAX_VOXEL_WRITES: usize = 4096;
+/// The voxel states of one [`World::set_voxels`] or [`World::set_chunk`] call together, so the
+/// call stays well under the platform's message limit once encoded.
+pub const MAX_VOXEL_WRITE_BYTES: usize = 2 << 20;
 /// A voxel's state bytes.
 pub const MAX_VOXEL_STATE: usize = 1024;
+/// A [`World::set_chunk`] grid: one type byte per voxel of the 16×16×16 chunk.
+pub const CHUNK_GRID_BYTES: usize = 4096;
+/// Voxel states stored with one [`World::set_chunk`].
+pub const MAX_CHUNK_STATES: usize = 4096;
 /// A chunk's state bytes ([`World::set_chunk_state`]).
 pub const MAX_CHUNK_STATE: usize = 65_536;
 /// A safety report's details, in characters as the game API counts them (UTF-16 units).
@@ -88,6 +95,15 @@ pub struct VoxelWrite {
     /// dense grid keeps to 0 to 15 on each axis.
     pub voxel: (i16, i16, i16),
     /// What a type means is up to the app.
+    pub voxel_type: i16,
+    pub state: Option<Vec<u8>>,
+}
+
+/// One voxel's state stored with a [`World::set_chunk`]: the voxel, its type and its bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkVoxelState {
+    /// `(x, y, z)` within the chunk.
+    pub voxel: (i16, i16, i16),
     pub voxel_type: i16,
     pub state: Option<Vec<u8>>,
 }
@@ -270,14 +286,151 @@ fn bad_reply(op: &str, e: impl std::fmt::Display) -> CallError {
     CallError { status: Status::Internal, message: format!("unexpected {op} reply: {e}") }
 }
 
+/// Refuses a voxel state over [`MAX_VOXEL_STATE`], or states over [`MAX_VOXEL_WRITE_BYTES`] together.
+fn check_state_bytes<'a>(states: impl Iterator<Item = Option<&'a [u8]>>) -> Result<(), CallError> {
+    let mut total = 0usize;
+    for s in states.flatten() {
+        if s.len() > MAX_VOXEL_STATE {
+            return Err(bad_request(format!("a voxel's state is at most {MAX_VOXEL_STATE} bytes")));
+        }
+        total += s.len();
+    }
+    if total > MAX_VOXEL_WRITE_BYTES {
+        return Err(bad_request(format!("the voxel states of one call are at most {MAX_VOXEL_WRITE_BYTES} bytes together")));
+    }
+    Ok(())
+}
+
 fn bad_request(message: impl Into<String>) -> CallError {
     CallError { status: Status::BadRequest, message: message.into() }
 }
 
 fn op<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: Value) -> Result<R, CallError> {
     let body = serde_json::to_vec(&body).map_err(|e| bad_request(e.to_string()))?;
-    let bytes = ctx.node(name, &body)?;
+    op_bytes(ctx, name, &body)
+}
+
+fn op_bytes<R: DeserializeOwned>(ctx: &Ctx, name: &str, body: &[u8]) -> Result<R, CallError> {
+    let bytes = ctx.node(name, body)?;
     serde_json::from_slice(&bytes).map_err(|e| bad_reply(name, e))
+}
+
+/// A request body written straight into bytes, for the batch writes. A `json!` tree costs a mod
+/// about 25,000 fuel per voxel write, so a 20,000,000-fuel call fits about 750 of them; this
+/// costs about 1,300. Keys are in the order `json!` writes them (sorted).
+struct Body(Vec<u8>);
+
+impl Body {
+    fn with_capacity(bytes: usize) -> Self {
+        Self(Vec::with_capacity(bytes))
+    }
+
+    fn raw(&mut self, text: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(text);
+        self
+    }
+
+    fn int(&mut self, v: i64) -> &mut Self {
+        if v < 0 {
+            self.0.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.0.extend_from_slice(&digits[at..]);
+        self
+    }
+
+    /// `{"x":"1","y":"-2","z":"3"}`: a chunk position, as [`ChunkPos::json`] writes it.
+    fn chunk(&mut self, at: ChunkPos) -> &mut Self {
+        self.raw(b"{\"x\":\"").int(at.x).raw(b"\",\"y\":\"").int(at.y).raw(b"\",\"z\":\"").int(at.z).raw(b"\"}")
+    }
+
+    fn voxel(&mut self, (x, y, z): (i16, i16, i16)) -> &mut Self {
+        self.raw(b"{\"x\":").int(x.into()).raw(b",\"y\":").int(y.into()).raw(b",\"z\":").int(z.into()).raw(b"}")
+    }
+
+    fn base64_or_null(&mut self, bytes: Option<&[u8]>) -> &mut Self {
+        match bytes {
+            Some(b) => {
+                self.0.push(b'"');
+                let start = self.0.len();
+                self.0.resize(start + base64::encoded_len(b.len(), true).unwrap_or(0), 0);
+                let written = B64.encode_slice(b, &mut self.0[start..]).unwrap_or(0);
+                self.0.truncate(start + written);
+                self.0.push(b'"');
+            }
+            None => self.0.extend_from_slice(b"null"),
+        }
+        self
+    }
+
+    /// The `stateBase64`, `voxel` and `voxelType` of one write or state, without its braces.
+    fn voxel_fields(&mut self, voxel: (i16, i16, i16), voxel_type: i16, state: Option<&[u8]>) -> &mut Self {
+        self.raw(b"\"stateBase64\":").base64_or_null(state).raw(b",\"voxel\":").voxel(voxel).raw(b",\"voxelType\":").int(voxel_type.into())
+    }
+}
+
+fn set_voxels_body(writes: &[VoxelWrite]) -> Vec<u8> {
+    let state_bytes: usize = writes.iter().filter_map(|w| w.state.as_ref()).map(|s| s.len() * 4 / 3 + 4).sum();
+    let mut body = Body::with_capacity(16 + writes.len() * 112 + state_bytes);
+    body.raw(b"{\"writes\":[");
+    for (i, w) in writes.iter().enumerate() {
+        if i > 0 {
+            body.raw(b",");
+        }
+        body.raw(b"{\"chunk\":").chunk(w.chunk).raw(b",").voxel_fields(w.voxel, w.voxel_type, w.state.as_deref()).raw(b"}");
+    }
+    body.raw(b"]}");
+    body.0
+}
+
+fn set_chunk_body(chunk: ChunkPos, grid: &[u8], states: &[ChunkVoxelState]) -> Vec<u8> {
+    let state_bytes: usize = states.iter().filter_map(|s| s.state.as_ref()).map(|s| s.len() * 4 / 3 + 4).sum();
+    let mut body = Body::with_capacity(5_600 + states.len() * 80 + state_bytes);
+    body.raw(b"{\"chunk\":").chunk(chunk).raw(b",\"gridBase64\":").base64_or_null(Some(grid));
+    if !states.is_empty() {
+        body.raw(b",\"states\":[");
+        for (i, s) in states.iter().enumerate() {
+            if i > 0 {
+                body.raw(b",");
+            }
+            body.raw(b"{").voxel_fields(s.voxel, s.voxel_type, s.state.as_deref()).raw(b"}");
+        }
+        body.raw(b"]");
+    }
+    body.raw(b"}");
+    body.0
+}
+
+/// An id the game API writes as a string, read without allocating one.
+struct WireId(u64);
+
+impl<'de> Deserialize<'de> for WireId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = WireId;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("an id")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<WireId, E> {
+                s.parse().map(WireId).map_err(E::custom)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<WireId, E> {
+                Ok(WireId(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -481,31 +634,41 @@ impl World<'_> {
         Ok(r.voxels.into_iter().map(Voxel::from).collect())
     }
 
-    /// Writes up to [`MAX_VOXEL_WRITES`] voxels in one transaction, as the app, and shows them
-    /// to nearby players. Returns the voxel update ids. Scope `world.write`.
+    /// Writes up to [`MAX_VOXEL_WRITES`] voxels in one transaction, as the app, and shows each
+    /// to nearby players as a voxel update. Their states may hold [`MAX_VOXEL_WRITE_BYTES`]
+    /// together. Returns the voxel update ids. A call costs one write per started 64 voxels
+    /// ([`crate::limits::node`]). Scope `world.write`.
     pub fn set_voxels(&self, writes: &[VoxelWrite]) -> Result<Vec<u64>, CallError> {
         if writes.is_empty() || writes.len() > MAX_VOXEL_WRITES {
             return Err(bad_request(format!("write 1 to {MAX_VOXEL_WRITES} voxels per call")));
         }
-        let mut list = Vec::with_capacity(writes.len());
-        for w in writes {
-            if w.state.as_ref().is_some_and(|s| s.len() > MAX_VOXEL_STATE) {
-                return Err(bad_request(format!("a voxel's state is at most {MAX_VOXEL_STATE} bytes")));
-            }
-            list.push(json!({
-                "chunk": w.chunk.json(),
-                "voxel": { "x": w.voxel.0, "y": w.voxel.1, "z": w.voxel.2 },
-                "voxelType": w.voxel_type,
-                "stateBase64": w.state.as_deref().map(b64),
-            }));
-        }
+        check_state_bytes(writes.iter().map(|w| w.state.as_deref()))?;
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct R {
-            voxel_update_ids: Vec<String>,
+            voxel_update_ids: Vec<WireId>,
         }
-        let r: R = op(self.0, "world.set_voxels", json!({ "writes": list }))?;
-        r.voxel_update_ids.iter().map(|id| id.parse().map_err(|e| bad_reply("world.set_voxels", e))).collect()
+        let r: R = op_bytes(self.0, "world.set_voxels", &set_voxels_body(writes))?;
+        Ok(r.voxel_update_ids.into_iter().map(|id| id.0).collect())
+    }
+
+    /// Replaces the chunk at `chunk` with `grid` (one type byte per voxel, index
+    /// `x + y*16 + z*256`) and `states`, and drops every voxel written into it before, so it
+    /// reads back exactly as written; its own state blob ([`World::set_chunk_state`]) is kept.
+    /// Nearby players are told once to read the chunk again rather than sent a voxel update per
+    /// voxel, so this is the cheap way to change most of a chunk; the grid's mods hear it as
+    /// `voxels`. A call costs one write plus one per started 64 states ([`crate::limits::node`]).
+    /// Scope `world.write`; a mod may set chunks only inside its grid, where its owner may edit.
+    pub fn set_chunk(&self, chunk: ChunkPos, grid: &[u8], states: &[ChunkVoxelState]) -> Result<(), CallError> {
+        if grid.len() != CHUNK_GRID_BYTES {
+            return Err(bad_request(format!("a chunk grid is {CHUNK_GRID_BYTES} bytes, one per voxel")));
+        }
+        if states.len() > MAX_CHUNK_STATES {
+            return Err(bad_request(format!("at most {MAX_CHUNK_STATES} voxel states per chunk")));
+        }
+        check_state_bytes(states.iter().map(|s| s.state.as_deref()))?;
+        let _: Value = op_bytes(self.0, "world.set_chunk", &set_chunk_body(chunk, grid, states))?;
+        Ok(())
     }
 
     /// Replaces the chunk's own state blob, the one [`Chunk::chunk_state`] reads (at most
@@ -816,6 +979,59 @@ impl Safety<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn written_batch_bodies_parse_as_the_json_trees_did() {
+        let writes = [
+            VoxelWrite {
+                chunk: ChunkPos::new(-9_000_000_000_000, 0, 7),
+                voxel: (i16::MIN, -1, i16::MAX),
+                voxel_type: i16::MIN,
+                state: Some(vec![0, 255, 7, 1]),
+            },
+            VoxelWrite { chunk: ChunkPos::new(1, -2, 3), voxel: (0, 15, 15), voxel_type: 9, state: None },
+            VoxelWrite { chunk: ChunkPos::new(i64::MAX, i64::MIN, 0), voxel: (1, 2, 3), voxel_type: 0, state: Some(vec![]) },
+        ];
+        let tree = json!({ "writes": writes.iter().map(|w| json!({
+            "chunk": w.chunk.json(),
+            "voxel": { "x": w.voxel.0, "y": w.voxel.1, "z": w.voxel.2 },
+            "voxelType": w.voxel_type,
+            "stateBase64": w.state.as_deref().map(b64),
+        })).collect::<Vec<_>>() });
+        let written = set_voxels_body(&writes);
+        assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), tree);
+        assert_eq!(written, serde_json::to_vec(&tree).unwrap(), "byte for byte, as json! writes it");
+
+        let grid: Vec<u8> = (0..CHUNK_GRID_BYTES).map(|i| (i % 251) as u8).collect();
+        let states = [
+            ChunkVoxelState { voxel: (-5, 0, 300), voxel_type: -2, state: Some(vec![9; 40]) },
+            ChunkVoxelState { voxel: (1, 1, 1), voxel_type: 4, state: None },
+        ];
+        let at = ChunkPos::new(-1, 2, -3);
+        let tree = json!({
+            "chunk": at.json(),
+            "gridBase64": b64(&grid),
+            "states": states.iter().map(|s| json!({
+                "voxel": { "x": s.voxel.0, "y": s.voxel.1, "z": s.voxel.2 },
+                "voxelType": s.voxel_type,
+                "stateBase64": s.state.as_deref().map(b64),
+            })).collect::<Vec<_>>(),
+        });
+        assert_eq!(serde_json::from_slice::<Value>(&set_chunk_body(at, &grid, &states)).unwrap(), tree);
+        let bare: Value = serde_json::from_slice(&set_chunk_body(at, &grid, &[])).unwrap();
+        assert_eq!(bare, json!({ "chunk": at.json(), "gridBase64": b64(&grid) }), "no states key when there are none");
+    }
+
+    #[test]
+    fn ids_read_from_strings_or_numbers() {
+        #[derive(Deserialize)]
+        struct R {
+            ids: Vec<WireId>,
+        }
+        let r: R = serde_json::from_str(r#"{"ids":["111458139590656",7]}"#).unwrap();
+        assert_eq!(r.ids.iter().map(|i| i.0).collect::<Vec<_>>(), vec![111_458_139_590_656, 7]);
+        assert!(serde_json::from_str::<R>(r#"{"ids":["x"]}"#).is_err());
+    }
+
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -1040,6 +1256,50 @@ mod tests {
         );
         let big = VoxelWrite { state: Some(vec![0; MAX_VOXEL_STATE + 1]), ..w };
         assert_eq!(refused_here(|c| c.world().set_voxels(&[big])).status, Status::BadRequest);
+    }
+
+    #[test]
+    fn a_whole_chunk_of_voxels_fits_one_set_voxels_and_the_states_share_a_cap() {
+        let at = |i: usize| VoxelWrite {
+            chunk: ChunkPos::new(0, 0, 0),
+            voxel: ((i % 16) as i16, (i / 16 % 16) as i16, (i / 256) as i16),
+            voxel_type: 1,
+            state: None,
+        };
+        let all: Vec<VoxelWrite> = (0..MAX_VOXEL_WRITES).map(at).collect();
+        let ids: Vec<String> = (0..MAX_VOXEL_WRITES).map(|i| i.to_string()).collect();
+        let (got, _, _) = exchange(json!({ "voxelUpdateIds": ids }), |c| c.world().set_voxels(&all));
+        assert_eq!(got.unwrap().len(), MAX_VOXEL_WRITES);
+        let one_more: Vec<VoxelWrite> = (0..=MAX_VOXEL_WRITES).map(at).collect();
+        assert_eq!(refused_here(|c| c.world().set_voxels(&one_more)).status, Status::BadRequest);
+        // 2,049 states of 1,024 bytes pass the shared 2 MiB.
+        let heavy: Vec<VoxelWrite> = (0..2049).map(|i| VoxelWrite { state: Some(vec![0; MAX_VOXEL_STATE]), ..at(i) }).collect();
+        assert_eq!(refused_here(|c| c.world().set_voxels(&heavy)).status, Status::BadRequest);
+    }
+
+    #[test]
+    fn set_chunk_sends_the_grid_and_its_states() {
+        let grid = vec![3u8; CHUNK_GRID_BYTES];
+        let states = vec![ChunkVoxelState { voxel: (1, 2, 3), voxel_type: -4, state: Some(vec![9]) }];
+        let (got, name, body) = exchange(json!({ "updatedAt": "t" }), |c| c.world().set_chunk(ChunkPos::new(7, 0, -2), &grid, &states));
+        got.unwrap();
+        assert_eq!(name, "world.set_chunk");
+        assert_eq!(body["chunk"], pos(7, 0, -2));
+        assert_eq!(B64.decode(body["gridBase64"].as_str().unwrap()).unwrap(), grid);
+        assert_eq!(body["states"], json!([{ "voxel": { "x": 1, "y": 2, "z": 3 }, "voxelType": -4, "stateBase64": "CQ==" }]));
+        let (_, _, bare) = exchange(json!({ "updatedAt": "t" }), |c| c.world().set_chunk(ChunkPos::default(), &grid, &[]));
+        assert!(bare.get("states").is_none(), "no states, no list");
+    }
+
+    #[test]
+    fn set_chunk_refuses_a_wrong_grid_or_too_many_states_before_sending() {
+        let short = vec![0u8; CHUNK_GRID_BYTES - 1];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &short, &[])).status, Status::BadRequest);
+        let grid = vec![0u8; CHUNK_GRID_BYTES];
+        let many = vec![ChunkVoxelState { voxel: (0, 0, 0), voxel_type: 1, state: None }; MAX_CHUNK_STATES + 1];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &grid, &many)).status, Status::BadRequest);
+        let big = vec![ChunkVoxelState { voxel: (0, 0, 0), voxel_type: 1, state: Some(vec![0; MAX_VOXEL_STATE + 1]) }];
+        assert_eq!(refused_here(|c| c.world().set_chunk(ChunkPos::default(), &grid, &big)).status, Status::BadRequest);
     }
 
     #[test]
