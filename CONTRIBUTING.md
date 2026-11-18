@@ -6,7 +6,8 @@ Issues and pull requests are welcome.
 
 `kit.pin` lists the paths that are byte-identical copies of the platform's own compute toolchain:
 the two SDK crates' sources, `instrument`, the build checks and their specs, the host catalog, the
-starters, the Rust pin and `vendor.lock`. They are never edited in this repository. A fix to one of
+starters, the CLIENT half template (`templates/client`, the platform's CLIENT half starter), the
+Rust pin and `vendor.lock`. They are never edited in this repository. A fix to one of
 them is made by the platform team in the platform itself and arrives here with the next sync, so a
 pull request that changes a copied file is closed with a pointer to where the change landed, or an
 issue to track it.
@@ -14,7 +15,7 @@ issue to track it.
 Everything else is this repository's own, and a pull request here changes it directly:
 
 - the `ckx-kit` command (`cli/`) and its tests;
-- the templates (`templates/`);
+- the hub and spoke templates (`templates/hub`, `templates/spoke`);
 - the crates' READMEs, the docs and the workflows.
 
 ## Before a pull request
