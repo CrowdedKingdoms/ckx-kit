@@ -253,8 +253,13 @@ impl BoardHub {
         let board = &mut self.board;
         match call.method {
             "submit" => {
-                if !matches!(call.caller, Caller::Instance(_) | Caller::Developer(_)) {
-                    return Err(kit::error(codes::FORBIDDEN, "scores come from the hub that decided them, not from players"));
+                match call.caller {
+                    Caller::Instance(_) | Caller::Developer(_) => {}
+                    // Not from a player, nor from the organization's own game server, whoever it
+                    // acts for: a game whose servers decide scores adds `Caller::Org { .. }` above.
+                    Caller::Player(_) | Caller::Org { .. } | Caller::Platform => {
+                        return Err(kit::error(codes::FORBIDDEN, "scores come from the hub that decided them, not from players"));
+                    }
                 }
                 let s: Submit = kit::args(call)?;
                 encode(&board.submit(s.player, s.score, now)?)
@@ -311,6 +316,9 @@ impl Hub for BoardHub {
                 let player = match (a.player, call.caller) {
                     (Some(p), _) => p,
                     (None, Caller::Player(p)) => p,
+                    // The organization's own game server names the player it asks about, as
+                    // every caller but the player does.
+                    (None, Caller::Org { .. }) => return Err(kit::error(codes::BAD_REQUEST, "name a player")),
                     _ => return Err(kit::error(codes::BAD_REQUEST, "name a player")),
                 };
                 encode(&board.around(player, a.radius.unwrap_or(2)))
@@ -373,6 +381,25 @@ mod tests {
         let mut sums = Board { config: Config { keep: Keep::Sum, ..Config::default() }, ..Default::default() };
         sums.submit(1, 5, 0).unwrap();
         assert_eq!(sums.submit(1, 7, 1).unwrap(), 12);
+    }
+
+    /// The organization's own game server is not the hub that decided a score, whoever it acts
+    /// for; and like every caller but the player themself, it names the player it asks about.
+    #[test]
+    fn the_organizations_server_submits_no_scores_and_names_the_player_it_asks_about() {
+        let mut hub = TestHub::<BoardHub>::spawn("leaderboard", "weekly").unwrap();
+        let _: i64 = hub.call_typed(Caller::Instance(4), "submit", &serde_json::json!({ "player": 1, "score": 9 })).unwrap();
+        for server in [Caller::Org { player: Some(1) }, Caller::Org { player: None }] {
+            let e = hub.call(server, "submit", &encode(&serde_json::json!({ "player": 1, "score": 99 })).unwrap()).unwrap_err();
+            assert_eq!(error_code(&e.message).map(|c| c.0), Some(codes::FORBIDDEN), "{server:?}");
+            let e = hub.call(server, "around", &encode(&serde_json::json!({})).unwrap()).unwrap_err();
+            assert_eq!(error_code(&e.message), Some((codes::BAD_REQUEST, "name a player")), "{server:?}");
+            let rows: Vec<serde_json::Value> = hub.call_typed(server, "around", &serde_json::json!({ "player": 1 })).unwrap();
+            assert_eq!(rows.len(), 1, "{server:?}");
+            assert!(hub.call(server, "me", &[]).is_err(), "`me` is the player's own session: {server:?}");
+        }
+        let rows: Vec<serde_json::Value> = hub.call_typed(Caller::Player(1), "around", &serde_json::json!({})).unwrap();
+        assert_eq!(rows[0]["score"], 9, "the server's score was not taken");
     }
 
     #[test]

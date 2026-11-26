@@ -606,6 +606,8 @@ impl ZoneHub {
                 let allowed = match call.caller {
                     Caller::Developer(_) => true,
                     Caller::Player(p) => self.zone.players.first().map(|c| c.player) == Some(p),
+                    // The player's own session, not the organization's game server acting for them.
+                    Caller::Org { .. } => false,
                     _ => false,
                 };
                 if !allowed {

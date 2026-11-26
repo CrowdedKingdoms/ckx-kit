@@ -11,7 +11,8 @@ use crate::{
     Call, CallError, Caller, Ctx, Error, Hub, Kind, Presence, Result, Session, Spoke, Status, TopicMsg, WorldEvent, abi, decode, encode,
 };
 
-pub const ABI_VERSION: u32 = 5;
+/// The guest ABI this SDK builds for. 6 adds the organization's server as a caller (kind 4).
+pub const ABI_VERSION: u32 = 6;
 
 /// Timers one hub may have pending.
 pub const MAX_TIMERS: usize = 1024;
@@ -531,6 +532,8 @@ pub fn handle(caller_kind: u32, caller_id: u64, buf_ptr: u32, method_len: u32, p
         1 => Caller::Instance(caller_id),
         2 => Caller::Player(caller_id),
         3 => Caller::Developer(caller_id),
+        // The player the organization's server says it acts for; 0 is the server itself.
+        4 => Caller::Org { player: (caller_id != 0).then_some(caller_id) },
         // Never the platform: a caller this SDK does not know is refused, not trusted.
         _ => return respond(Err(Error::new("unknown caller kind"))),
     };
