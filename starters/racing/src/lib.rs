@@ -390,6 +390,8 @@ impl RaceHub {
                 let allowed = match call.caller {
                     Caller::Developer(_) => true,
                     Caller::Player(p) => self.race.racers.first().map(|r| r.player) == Some(p),
+                    // The player's own session, not the organization's game server acting for them.
+                    Caller::Org { .. } => false,
                     _ => false,
                 };
                 if !allowed {
@@ -833,6 +835,8 @@ impl BallHub {
                 let allowed = match call.caller {
                     Caller::Developer(_) => true,
                     Caller::Player(p) => g.players.first().map(|f| f.player) == Some(p),
+                    // The player's own session, not the organization's game server acting for them.
+                    Caller::Org { .. } => false,
                     _ => false,
                 };
                 if !allowed {

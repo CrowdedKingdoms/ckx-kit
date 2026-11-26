@@ -39,7 +39,7 @@
 //! Hubs also get platform events, each a default no-op on [`Hub`]: timers they set
 //! ([`Hub::on_timer`]), topics they watch ([`Hub::on_topic`]), players entering and leaving
 //! the app ([`Hub::on_presence`], root hub only) and players' connections subscribing to them
-//! ([`Hub::on_session`]). A timer can follow a cron schedule, the legacy automations' syntax:
+//! ([`Hub::on_session`]; a developer's or an organization's server's connection sends none). A timer can follow a cron schedule, the legacy automations' syntax:
 //! see [`cron`] and [`Ctx::timer_cron`]. Two more concern what a hub holds about a player:
 //! erasing it when their account is erased ([`Hub::on_player_erased`]) and exporting it
 //! ([`Hub::on_player_export`]); a hub that does not implement them answers "not implemented".
@@ -154,6 +154,45 @@ pub enum Caller {
     /// `execConnectAsDeveloper`: studio tools, manual runs and admin endpoints. It may call any
     /// type, not only `client` ones, so check for it in handlers only developers should reach.
     Developer(u64),
+    /// The app's organization's own game server, connected with `execConnectAsServer`. It may
+    /// call any type, not only `client` ones. `player` is who the server says the call is for;
+    /// `None` is the server itself.
+    ///
+    /// The platform checked that the connection is the organization's. It did **not** check the
+    /// player: `Org { player: Some(p) }` is "this organization's server says player `p`", and
+    /// [`Caller::Player`]`(p)` is "the platform saw `p`'s own session". The organization vouches
+    /// for who its players are, so a hub that trusts its organization's servers may take either
+    /// as `p` ([`Call::player_or_org`]); one that must hear from the player's own device takes
+    /// only [`Caller::Player`] ([`Call::player`]). The player may be any id at all: the
+    /// platform does not check that the organization manages them, or that they exist.
+    Org {
+        player: Option<u64>,
+    },
+}
+
+impl Caller {
+    /// The player whose own session the platform saw making this call: `Some` for
+    /// [`Caller::Player`] alone, never for what an organization's server says.
+    pub fn verified_player(&self) -> Option<u64> {
+        match *self {
+            Caller::Player(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The player the call is for, on the platform's word ([`Caller::Player`]) or on the
+    /// organization's ([`Caller::Org`] naming one).
+    pub fn player_or_org(&self) -> Option<u64> {
+        match *self {
+            Caller::Player(p) | Caller::Org { player: Some(p) } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Whether the caller is the organization's own game server, acting for a player or not.
+    pub fn is_org(&self) -> bool {
+        matches!(self, Caller::Org { .. })
+    }
 }
 
 /// One incoming call.
@@ -169,11 +208,33 @@ impl Call<'_> {
         decode(self.payload)
     }
 
-    /// The calling player, or an error when the caller is not a player.
+    /// The calling player, or an error when the caller is not a player. The player's own
+    /// session, which the platform saw: an organization's server naming a player
+    /// ([`Caller::Org`]) is refused here; [`Call::player_or_org`] takes its word.
     pub fn player(&self) -> Result<u64> {
         match self.caller {
             Caller::Player(p) => Ok(p),
             other => Err(Error(format!("`{}` is for players, not {other:?}", self.method))),
+        }
+    }
+
+    /// The player the call is for: the calling player, or the one the organization's own game
+    /// server says it acts for. An error for anyone else, the server calling for itself
+    /// included. The first is the platform's word and the second the organization's: see
+    /// [`Caller::Org`].
+    pub fn player_or_org(&self) -> Result<u64> {
+        self.caller.player_or_org().ok_or_else(|| {
+            Error(format!("`{}` is for players and the organization's servers acting for one, not {:?}", self.method, self.caller))
+        })
+    }
+
+    /// The organization's own game server calling, with the player it says it acts for (`None`:
+    /// itself), or an error when the caller is not one: the guard for an endpoint only the
+    /// organization's servers should reach.
+    pub fn org(&self) -> Result<Option<u64>> {
+        match self.caller {
+            Caller::Org { player } => Ok(player),
+            other => Err(Error(format!("`{}` is for the organization's servers, not {other:?}", self.method))),
         }
     }
 
