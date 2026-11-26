@@ -417,6 +417,9 @@ impl RunHub {
                 let party = match call.caller {
                     Caller::Player(p) => vec![p],
                     Caller::Developer(_) => o.party,
+                    // A player opens their own run from their own session: the organization's
+                    // game server is refused, whoever it acts for.
+                    Caller::Org { .. } => return Err(kit::error(codes::FORBIDDEN, "a player or a developer opens a run")),
                     _ => return Err(kit::error(codes::FORBIDDEN, "a player or a developer opens a run")),
                 };
                 let seed = o.seed.unwrap_or_else(|| Rng::seed_from(&ctx.key) ^ now);
@@ -442,6 +445,8 @@ impl RunHub {
                 let allowed = match call.caller {
                     Caller::Developer(_) => true,
                     Caller::Player(p) => self.run.owner == Some(p),
+                    // The player's own session, not the organization's game server acting for them.
+                    Caller::Org { .. } => false,
                     _ => false,
                 };
                 if !allowed {
@@ -622,6 +627,23 @@ mod tests {
             }
         }
         assert_eq!(run.phase, Phase::Wiped, "{:?}", run.log);
+    }
+
+    /// A player opens their own run from their own session, and its owner abandons it: the
+    /// organization's own game server does neither, whoever it acts for.
+    #[test]
+    fn the_organizations_server_neither_opens_nor_abandons_a_run() {
+        let mut hub = TestHub::<RunHub>::spawn_with("instance", "run-d", br#"{"idle_ms":120000}"#).unwrap();
+        for server in [Caller::Org { player: Some(1) }, Caller::Org { player: None }] {
+            let e = hub.call(server, "open", &encode(&json!({ "seed": 7 })).unwrap()).unwrap_err();
+            assert_eq!(error_code(&e.message), Some((codes::FORBIDDEN, "a player or a developer opens a run")), "{server:?}");
+        }
+        let _: u64 = hub.call_typed(Caller::Player(1), "open", &json!({ "seed": 7 })).unwrap();
+        for server in [Caller::Org { player: Some(1) }, Caller::Org { player: None }] {
+            let e = hub.call(server, "abandon", &encode(&()).unwrap()).unwrap_err();
+            assert_eq!(error_code(&e.message), Some((codes::FORBIDDEN, "the run's owner, or a developer, abandons it")), "{server:?}");
+        }
+        let _: bool = hub.call_typed(Caller::Player(1), "abandon", &()).unwrap();
     }
 
     #[test]

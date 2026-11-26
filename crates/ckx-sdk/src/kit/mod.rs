@@ -342,6 +342,11 @@ fn caller_key(caller: Caller) -> Option<String> {
         Caller::Player(p) => Some(format!("p{p}")),
         Caller::Developer(u) => Some(format!("d{u}")),
         Caller::Instance(i) => Some(format!("i{i}")),
+        // The organization's server, for itself or for a player: never that player's own key,
+        // so an action id the server sent is not answered from the player's receipt, nor the
+        // reverse.
+        Caller::Org { player: None } => Some("o".to_owned()),
+        Caller::Org { player: Some(p) } => Some(format!("o{p}")),
         Caller::Platform => None,
     }
 }
@@ -503,6 +508,22 @@ mod tests {
         r.record(Caller::Platform, id, &Ok(vec![1]), 0);
         r.record(Caller::Player(1), None, &Ok(vec![1]), 0);
         assert_eq!(r.len(), 2, "no receipt without a caller to answer or an id");
+    }
+
+    /// The organization's server is a caller of its own, whoever it says it acts for: its
+    /// action ids are not the player's, nor the player's its.
+    #[test]
+    fn a_servers_receipts_are_not_the_player_it_names() {
+        let mut r = Receipts::new();
+        let (player, for_player, itself) = (Caller::Player(1), Caller::Org { player: Some(1) }, Caller::Org { player: None });
+        r.record(player, Some("a1"), &Ok(vec![9]), 0);
+        assert!(r.replay(for_player, Some("a1"), 1).is_none() && r.replay(itself, Some("a1"), 1).is_none());
+        r.record(for_player, Some("s1"), &Ok(vec![7]), 0);
+        r.record(itself, Some("s2"), &Ok(vec![8]), 0);
+        assert_eq!(r.replay(for_player, Some("s1"), 1).unwrap().unwrap(), vec![7], "the server sending its action again");
+        assert_eq!(r.replay(itself, Some("s2"), 1).unwrap().unwrap(), vec![8]);
+        assert!(r.replay(player, Some("s1"), 1).is_none() && r.replay(itself, Some("s1"), 1).is_none());
+        assert!(r.replay(Caller::Org { player: Some(2) }, Some("s1"), 1).is_none(), "nor another player it names");
     }
 
     #[test]

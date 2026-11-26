@@ -224,6 +224,9 @@ impl GameSession {
         let allowed = match caller {
             Caller::Developer(_) => true,
             Caller::Player(p) => self.host == Some(p),
+            // The host's own session configures it: not the organization's game server, even
+            // acting for the host.
+            Caller::Org { .. } => false,
             _ => false,
         };
         if !allowed || self.phase != Phase::Lobby {
@@ -240,8 +243,12 @@ impl GameSession {
     }
 
     fn reserve(&mut self, caller: Caller, players: Vec<u64>) -> Result<()> {
-        if !matches!(caller, Caller::Instance(_) | Caller::Developer(_)) {
-            return Err(kit::error(codes::FORBIDDEN, "reserve is for the matchmaker"));
+        match caller {
+            Caller::Instance(_) | Caller::Developer(_) => {}
+            // Not a player, nor the organization's own game server, whoever it acts for.
+            Caller::Player(_) | Caller::Org { .. } | Caller::Platform => {
+                return Err(kit::error(codes::FORBIDDEN, "reserve is for the matchmaker"));
+            }
         }
         if self.phase != Phase::Lobby || !self.players.is_empty() {
             return Err(kit::error(codes::CONFLICT, "the session is already in use"));
@@ -414,6 +421,24 @@ mod tests {
         assert!(!s.play(1, Some(&Action { points: 1 })).unwrap());
         assert_eq!((s.phase, s.winner), (Phase::Finished, Some(1)));
         assert_eq!(s.moves.iter().filter(|m| m.points.is_none()).count(), 1);
+    }
+
+    /// Configuring is the host's own session's (or a developer's), and reserving the
+    /// matchmaker's: the organization's own game server does neither, even acting for the host.
+    #[test]
+    fn the_organizations_server_neither_configures_nor_reserves() {
+        let mut s = lobby(&[1, 2]);
+        for server in [Caller::Org { player: Some(1) }, Caller::Org { player: None }] {
+            let Error(why) = s.configure(server, Config::default()).unwrap_err();
+            assert_eq!(error_code(&why), Some((codes::FORBIDDEN, "the host configures the session in the lobby")), "{server:?}");
+        }
+        s.configure(Caller::Player(1), Config::default()).unwrap();
+        let mut empty = GameSession::default();
+        for server in [Caller::Org { player: Some(1) }, Caller::Org { player: None }, Caller::Player(1)] {
+            let Error(why) = empty.reserve(server, vec![1, 2]).unwrap_err();
+            assert_eq!(error_code(&why), Some((codes::FORBIDDEN, "reserve is for the matchmaker")), "{server:?}");
+        }
+        empty.reserve(Caller::Instance(4), vec![1, 2]).unwrap();
     }
 
     #[test]
