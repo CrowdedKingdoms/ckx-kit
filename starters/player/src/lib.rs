@@ -554,9 +554,14 @@ impl PlayerHub {
         earned.levels += self.progress.gain(&self.config.levels, xp);
     }
 
+    /// The owner's calls: from the owner's own session, or from the organization's own game
+    /// server acting for the owner. The first is the platform's word for who is calling and the
+    /// second the organization's, which this hub takes: the organization's servers already run
+    /// the game its players play. Nobody else's: not the server acting for another player, nor
+    /// for itself.
     fn owner_of(&self, call: &Call<'_>) -> Result<()> {
         match call.caller {
-            Caller::Player(p) if p == self.owner => Ok(()),
+            Caller::Player(p) | Caller::Org { player: Some(p) } if p == self.owner => Ok(()),
             Caller::Developer(_) => Ok(()),
             _ => Err(kit::error(codes::FORBIDDEN, "this is another player's")),
         }
@@ -833,7 +838,11 @@ impl Hub for PlayerHub {
         let result = match call.caller {
             Caller::Instance(_) => self.trusted(&call, now, &mut earned),
             Caller::Developer(_) if matches!(call.method, "grant" | "record" | "deposit") => self.trusted(&call, now, &mut earned),
-            Caller::Player(_) if matches!(call.method, "grant" | "record" | "hold" | "settle" | "release" | "deposit" | "exchange") => {
+            // The organization's own game server asks what its player may ask and no more: what
+            // the game's hubs grant, hold and settle does not come from it either.
+            Caller::Player(_) | Caller::Org { .. }
+                if matches!(call.method, "grant" | "record" | "hold" | "settle" | "release" | "deposit" | "exchange") =>
+            {
                 Err(kit::error(codes::FORBIDDEN, format!("`{}` comes from the game's hubs", call.method)))
             }
             _ => Receipts::run(self, |h| &mut h.receipts, &call, now, |h| h.act(&call, now, &mut earned)),
@@ -880,6 +889,55 @@ mod tests {
         assert_eq!(code(&e), Some(codes::FORBIDDEN), "only its player reads it");
         let p: ProfileView = h.call_typed(Caller::Player(8), "profile", &()).unwrap();
         assert_eq!((p.player, p.level), (7, 1));
+    }
+
+    /// The owner's calls come from the owner's own session or from the organization's own game
+    /// server acting for the owner, and from nobody else: not the server acting for another
+    /// player, nor for itself. The server asks what the player may ask, and no more.
+    #[test]
+    fn the_owners_calls_come_from_the_owner_or_the_organizations_server_acting_for_them() {
+        let mut h = hub();
+        let (owner, for_owner) = (Caller::Player(7), Caller::Org { player: Some(7) });
+        let _: bool =
+            h.call_typed(Caller::Developer(1), "deposit", &json!({ "ref": "seed-wood", "bundle": { "items": { "wood": 4 } } })).unwrap();
+        // The server reads the owner's hub and acts in it as the owner does.
+        let me: MeView = h.call_typed(for_owner, "me", &()).unwrap();
+        assert_eq!(me.wallet.balances["gold"], 100);
+        let crafted: Crafted = h.call_typed(for_owner, "craft", &json!({ "recipe": "plank", "times": 1, "action_id": "s1" })).unwrap();
+        assert_eq!(crafted.made, Bundle::item("plank", 1));
+        let again: Crafted = h.call_typed(for_owner, "craft", &json!({ "recipe": "plank", "times": 1, "action_id": "s1" })).unwrap();
+        assert_eq!(again, crafted, "the server's resent craft is answered, not made again");
+        // The owner's own action under the same id is the owner's, not the server's: it runs.
+        let own: Crafted = h.call_typed(owner, "craft", &json!({ "recipe": "plank", "times": 1, "action_id": "s1" })).unwrap();
+        assert_eq!(own.made, Bundle::item("plank", 1));
+        let inv: InventoryView = h.call_typed(owner, "inventory", &()).unwrap();
+        assert_eq!(inv.stacks.iter().find(|s| s.item == "plank").map(|s| s.count), Some(2), "both crafts are in the one inventory");
+        // Nobody else's: the server acting for another player, or for itself, is refused what
+        // another player is refused, reads and actions alike.
+        for other in [Caller::Org { player: Some(8) }, Caller::Org { player: None }, Caller::Player(8)] {
+            for method in ["me", "inventory", "wallet", "progress"] {
+                let e = h.call(other, method, &[]).unwrap_err();
+                assert_eq!(code(&e), Some(codes::FORBIDDEN), "{method} from {other:?}");
+            }
+            let e = h.call(other, "craft", &encode(&json!({ "recipe": "plank", "action_id": "x1" })).unwrap()).unwrap_err();
+            assert_eq!(code(&e), Some(codes::FORBIDDEN), "craft from {other:?}");
+            // The public profile is anyone's to read.
+            let p: ProfileView = h.call_typed(other, "profile", &()).unwrap();
+            assert_eq!(p.player, 7);
+        }
+        // What the game's hubs grant, hold and settle comes from them: not from a player, and
+        // not from the server, for the owner or for itself.
+        for server in [for_owner, Caller::Org { player: None }] {
+            for method in ["grant", "record", "hold", "settle", "release", "deposit", "exchange"] {
+                let e = h
+                    .call(server, method, &encode(&json!({ "ref": "r1", "bundle": { "currency": { "gold": 1_000 } } })).unwrap())
+                    .unwrap_err();
+                assert_eq!(code(&e), Some(codes::FORBIDDEN), "{method} from {server:?}");
+                assert!(e.message.contains("comes from the game's hubs"), "{method} from {server:?}: {e}");
+            }
+        }
+        let w: WalletView = h.call_typed(owner, "wallet", &()).unwrap();
+        assert_eq!(w.balances["gold"], 100 + 10, "the first craft's achievement, and nothing a server granted");
     }
 
     #[test]
