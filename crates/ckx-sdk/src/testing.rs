@@ -1,7 +1,8 @@
 //! Unit tests for hubs, spokes and mods, run natively with `cargo test`.
 //!
 //! [`TestHub`] and [`TestSpoke`] run a node on the test's thread the way a sandbox runs it:
-//! calls from players, developers and other instances; a hub's platform events (timers on a
+//! calls from players, developers, the organization's own game servers and other instances; a
+//! hub's platform events (timers on a
 //! clock the test moves, topics it watches, presence, sessions, a mod's world events, and a
 //! player's erasure and export); and a snapshot and a start from it. The platform's side is a [`FakePlatform`]. It keeps what the
 //! node logged, published, sent and emitted; holds each call to the sandbox's bounds
@@ -45,6 +46,41 @@
 //! assert_eq!(hub.published()[0].0, "total");
 //! hub.restart().unwrap();
 //! assert_eq!(hub.hub().total, 5);
+//! ```
+//!
+//! A call from the organization's own game server is `Caller::Org { player }`: `Some(p)` when
+//! it acts for player `p`, `None` for itself. The platform checks the server is the
+//! organization's and takes the player on the organization's word, so a test passes any id
+//! there, and a hub that must hear from the player's own session tests that it refuses it:
+//!
+//! ```
+//! # use ckx_sdk::prelude::*;
+//! # use ckx_sdk::testing::TestHub;
+//! # #[derive(Default, Serialize, Deserialize)]
+//! # struct Purse { owner: u64, gold: i64 }
+//! # impl Hub for Purse {
+//! #     fn spawn(ctx: &Ctx, _seed: &[u8]) -> Result<Self> { Ok(Self { owner: ctx.key.parse().unwrap_or(0), gold: 0 }) }
+//! #     fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> { decode(snapshot) }
+//! #     fn persist(&mut self, _ctx: &Ctx) -> Result<Vec<u8>> { encode(self) }
+//! fn handle(&mut self, _ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
+//!     match call.method {
+//!         // The owner, or the organization's server acting for the owner.
+//!         "balance" if call.player_or_org()? == self.owner => encode(&self.gold),
+//!         // Only the owner's own session spends.
+//!         "spend" if call.player()? == self.owner => { self.gold -= call.decode::<i64>()?; encode(&self.gold) }
+//!         // Only the organization's servers pay out.
+//!         "reward" => { call.org()?; self.gold += call.decode::<i64>()?; encode(&self.gold) }
+//!         other => Err(Error::unknown_method(other)),
+//!     }
+//! }
+//! # }
+//! let mut purse = TestHub::<Purse>::spawn("purse", "42").unwrap();
+//! let gold: i64 = purse.call_typed(Caller::Org { player: None }, "reward", &10).unwrap();
+//! assert_eq!(gold, 10);
+//! let seen: i64 = purse.call_typed(Caller::Org { player: Some(42) }, "balance", &()).unwrap();
+//! assert_eq!(seen, 10);
+//! assert!(purse.call_typed::<_, i64>(Caller::Org { player: Some(42) }, "spend", &5).is_err());
+//! assert!(purse.call_typed::<_, i64>(Caller::Player(42), "reward", &5).is_err());
 //! ```
 //!
 //! Fuel, memory and deadlines are the platform's alone: they meter the built module, which the
@@ -434,6 +470,10 @@ impl FakePlatform {
                 Err(bad_request("the platform calls a node only with its events: advance, topic, presence, session, world, erase, export"))
             }
             Caller::Instance(_) if self.state.borrow().is_mod() => Err(denied("only players call mods")),
+            // The platform reads player 0 as the server itself, and never sends it as a player.
+            Caller::Org { player: Some(0) } => {
+                Err(bad_request("there is no player 0: the organization's server calling for itself is `Caller::Org { player: None }`"))
+            }
             _ => Ok(()),
         }
     }
@@ -1589,6 +1629,83 @@ mod tests {
         hub.call(Caller::Player(1), "flood", &[]).unwrap();
         let e = hub.export(7).unwrap_err();
         assert!(e.status == Status::AppError && e.message.contains("exceeds"), "{e}");
+    }
+
+    /// What the platform holds an organization's server to, and what it leaves to the hub: the
+    /// server reaches a hub as `Caller::Org`, never as the player it names; `$` methods stay the
+    /// platform's; a session event is only ever a player's own.
+    #[test]
+    fn the_organizations_server_calls_as_itself_or_for_a_player_and_is_never_that_player() {
+        /// What each kind of caller reached.
+        #[derive(Default, Serialize, Deserialize)]
+        struct Door {
+            seen: Vec<String>,
+            sessions: Vec<u64>,
+        }
+
+        impl Hub for Door {
+            fn spawn(_ctx: &Ctx, _seed: &[u8]) -> Result<Self> {
+                Ok(Self::default())
+            }
+
+            fn load(_ctx: &Ctx, snapshot: &[u8], _from_version: u64) -> Result<Self> {
+                decode(snapshot)
+            }
+
+            fn persist(&mut self, _ctx: &Ctx) -> Result<Vec<u8>> {
+                encode(self)
+            }
+
+            fn handle(&mut self, _ctx: &Ctx, call: Call<'_>) -> Result<Vec<u8>> {
+                let who = match call.method {
+                    "own" => format!("own:{}", call.player()?),
+                    "for" => format!("for:{}", call.player_or_org()?),
+                    "server" => format!("server:{:?}", call.org()?),
+                    "admin" => format!("admin:{}", call.developer()?),
+                    other => return Err(Error::unknown_method(other)),
+                };
+                self.seen.push(who.clone());
+                encode(&who)
+            }
+
+            fn on_session(&mut self, _ctx: &Ctx, player: u64, _session: Session) -> Result<()> {
+                self.sessions.push(player);
+                Ok(())
+            }
+        }
+
+        let mut hub = TestHub::<Door>::spawn("door", "a").unwrap();
+        let (acting, itself, player) = (Caller::Org { player: Some(42) }, Caller::Org { player: None }, Caller::Player(42));
+        let mut ask = |caller, method: &str| hub.call_typed::<_, String>(caller, method, &()).map_err(|e| (e.status, e.message));
+        // The player's own session and the server's word for them both name player 42...
+        assert_eq!(ask(player, "for").as_deref(), Ok("for:42"));
+        assert_eq!(ask(acting, "for").as_deref(), Ok("for:42"));
+        // ...but only the first is the player, and only the second the server.
+        assert_eq!(ask(player, "own").as_deref(), Ok("own:42"));
+        let (status, why) = ask(acting, "own").unwrap_err();
+        assert!(status == Status::AppError && why.contains("is for players, not Org { player: Some(42) }"), "{why}");
+        assert_eq!(ask(acting, "server").as_deref(), Ok("server:Some(42)"));
+        assert_eq!(ask(itself, "server").as_deref(), Ok("server:None"));
+        assert!(ask(player, "server").unwrap_err().1.contains("is for the organization's servers, not Player(42)"));
+        assert!(ask(Caller::Developer(7), "server").is_err() && ask(Caller::Instance(9), "server").is_err());
+        // The server calling for itself is for no player, and no developer.
+        assert!(ask(itself, "for").unwrap_err().1.contains("not Org { player: None }"));
+        assert!(ask(itself, "own").is_err() && ask(itself, "admin").is_err() && ask(acting, "admin").is_err());
+        // Player 0 is nobody: the platform sends the server itself for it.
+        assert_eq!(ask(Caller::Org { player: Some(0) }, "for").unwrap_err().0, Status::BadRequest);
+        // The platform's methods are refused it as they are everyone.
+        for method in ["$session", "$timer", "$erase", "$export", "$topic"] {
+            for server in [acting, itself] {
+                assert_eq!(hub.call(server, method, &[1]).unwrap_err().status, Status::Denied, "{method} from {server:?}");
+            }
+        }
+        // A session event is a player's own connection, and reaches the hub as that player.
+        hub.session(42, Session::Joined).unwrap();
+        assert_eq!(hub.hub().sessions, vec![42]);
+        assert_eq!(hub.hub().seen, vec!["for:42", "for:42", "own:42", "server:Some(42)", "server:None"]);
+        assert_eq!((acting.verified_player(), acting.player_or_org(), acting.is_org()), (None, Some(42), true));
+        assert_eq!((player.verified_player(), player.player_or_org(), player.is_org()), (Some(42), Some(42), false));
+        assert_eq!((itself.verified_player(), itself.player_or_org(), itself.is_org()), (None, None, true));
     }
 
     #[test]
